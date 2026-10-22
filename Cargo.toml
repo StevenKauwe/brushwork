@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/brushwork", "crates/brushwork-kit", "crates/brushwork-paint", "tools/flickscan"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/StevenKauwe/brushwork"
+authors = ["Steven Kaai Kauwe"]
+
+[workspace.dependencies]
+brushwork = { path = "crates/brushwork" }
+brushwork-kit = { path = "crates/brushwork-kit" }
+brushwork-paint = { path = "crates/brushwork-paint" }
+rayon = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+bytemuck = "1"
+wgpu = "30.0.1"
+pollster = "0.4"
+
+[profile.release]
+debug = false
+
+# the painter is slow unoptimised; tests stay fast with it optimised
+[profile.dev.package."*"]
+opt-level = 3
+[profile.dev.package.brushwork]
+opt-level = 3

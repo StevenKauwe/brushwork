@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, tests (CPU), wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (the version, targets and components in rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: clippy (CPU only)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy (with the GPU backend)
+        run: cargo clippy --workspace --all-targets --locked --features brushwork/gpu -- -D warnings
+      - name: tests (CPU)
+        run: cargo test --workspace --locked --release
+      - name: GPU tests compile (no GPU on CI, so they are built, not run)
+        run: cargo test --workspace --locked --release --features brushwork/gpu --no-run
+      - name: the CPU path builds for wasm32
+        run: cargo check --locked --target wasm32-unknown-unknown -p brushwork -p brushwork-kit -p brushwork-paint

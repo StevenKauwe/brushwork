@@ -1,0 +1,8 @@
+[package]
+name = "brushwork-kit"
+description = "The brush kit: time, easing, motion principles, geometry, colour, and spectral (Kubelka-Munk) pigment mixing. Pure functions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true

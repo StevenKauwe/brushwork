@@ -1,0 +1,11 @@
+[package]
+name = "brushwork-paint"
+description = "The shape recorder a film's shots draw with (paint, ink lines, glows, camera, boil keys), films and shots, look presets and full-frame transitions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+brushwork-kit.workspace = true

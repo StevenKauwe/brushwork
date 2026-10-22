@@ -1,0 +1,21 @@
+[package]
+name = "brushwork"
+description = "An oil painter in pure Rust: repaints recorded shapes (or a photo) as bristle strokes with wet pickup, spectral pigment mixing and lit relief, steady from frame to frame. CPU, with an optional GPU backend (wgpu)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+brushwork-kit.workspace = true
+brushwork-paint.workspace = true
+image.workspace = true
+rayon.workspace = true
+bytemuck.workspace = true
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[features]
+# lay strokes on the GPU (wgpu); the CPU engine stays the reference. Pick it at run time with OIL_BACKEND=gpu.
+gpu = ["dep:wgpu", "dep:pollster"]
