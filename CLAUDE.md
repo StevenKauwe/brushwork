@@ -19,6 +19,12 @@ A pure-Rust oil painter (see README.md). Used by music-to-movie-magic (the films
 `--features brushwork/gpu`), `cargo test --workspace --release`. With a GPU, also
 `OIL_TEST_BACKEND=gpu cargo test --release --features brushwork/gpu`.
 
+## The canvas page
+`crates/brushwork-web` (UI + Web Worker, pure Rust; `web/` holds the page and the 8-line worker bootstrap).
+`tools/build-web.sh` builds `dist/`; `cargo run -p webcheck -- --dir dist [--phone]` checks it paints (CI runs it in
+WebKit and deploys `dist/` to https://stevenkauwe.github.io/brushwork/ from main). Keep `RUSTFLAGS` empty: iPhone
+WebKit rejects relaxed SIMD.
+
 ## Releasing
 Tag `vX.Y.Z` on a green main, then bump the pin in music-to-movie-magic (`studio/Cargo.toml`) and CrabScape
 (`crates/painter/Cargo.toml`). CrabScape needs its atlas repainted (`tools/paint-oil-crab.sh`) if pixels changed.

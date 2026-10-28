@@ -1,0 +1,13 @@
+[package]
+name = "webcheck"
+description = "Opens the canvas page in a real browser through WebDriver (WebKit, the iPhone's engine, or Chromium) and checks that a painting appears."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"

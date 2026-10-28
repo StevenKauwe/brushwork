@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/brushwork", "crates/brushwork-kit", "crates/brushwork-paint", "tools/flickscan"]
+members = ["crates/brushwork", "crates/brushwork-kit", "crates/brushwork-paint", "crates/brushwork-web", "tools/flickscan", "tools/webcheck"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/StevenKauwe/brushwork"

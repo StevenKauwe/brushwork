@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ece4d6">
+<meta name="description" content="brushwork: lay down flat shapes and an oil painter in pure Rust paints them, bristle by bristle.">
+<title>brushwork canvas</title>
+<style>
+  :root {
+    --bg: #ece4d6; --panel: #f6f1e8; --ink: #2a2420; --muted: #6d6158; --line: #d4c8b6; --accent: #b5652f;
+    --accent-ink: #fff8ef; --focus: #3e6e9e;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1d1a1f; --panel: #27232a; --ink: #efe7dc; --muted: #b3a798; --line: #3c3540; --accent: #d9813f; --accent-ink: #1d1a1f; --focus: #8fb4e0; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font: 16px/1.45 ui-serif, Georgia, "Iowan Old Style", serif;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  main { max-width: 1024px; margin: 0 auto; display: grid; gap: 12px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+  h1 { font-size: 1.6rem; margin: 0; letter-spacing: 0.01em; }
+  header p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+  .frame { position: relative; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); background: #d8cfc0; }
+  canvas { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; touch-action: none; cursor: crosshair; }
+  #bar { position: absolute; left: 0; bottom: 0; height: 4px; width: 0; background: var(--accent); transition: width 0.15s, opacity 0.3s; opacity: 0; }
+  #status { margin: 0; min-height: 1.45em; color: var(--muted); font: 0.9rem/1.45 ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .label { font: 0.75rem/1 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+  button {
+    font: 600 0.95rem/1 ui-sans-serif, system-ui, sans-serif; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 0 16px; min-height: 44px; cursor: pointer;
+  }
+  button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .swatch { width: 44px; min-height: 44px; padding: 0; border-radius: 50%; border: 2px solid var(--line); }
+  .swatch[aria-pressed="true"] { border-color: var(--ink); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ink); background-clip: padding-box; }
+  footer { color: var(--muted); font: 0.85rem/1.5 ui-sans-serif, system-ui, sans-serif; }
+  footer a { color: inherit; }
+  @media (prefers-reduced-motion: reduce) { #bar { transition: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>brushwork</h1>
+    <p>Draw flat shapes. An oil painter in pure Rust paints them, bristle by bristle.</p>
+  </header>
+  <div class="frame">
+    <canvas id="canvas" width="1024" height="576" data-state="flat" aria-label="Canvas: drag to draw a shape"></canvas>
+    <div id="bar"></div>
+  </div>
+  <p id="status" role="status">Loading the painter…</p>
+  <div class="row">
+    <button id="paint" class="primary">Paint</button>
+    <button id="reseed">New seed</button>
+    <button id="compare" disabled>Show shapes</button>
+  </div>
+  <div class="row" id="palette"><span class="label">Colour</span></div>
+  <div class="row">
+    <span class="label">Next shape</span>
+    <button id="subject" aria-pressed="true">Subject (casts a shadow)</button>
+    <button id="outline" aria-pressed="true">Outline</button>
+  </div>
+  <div class="row">
+    <button id="undo">Undo</button>
+    <button id="clear">Clear</button>
+    <button id="sample">Sample scene</button>
+  </div>
+  <footer>
+    Drag on the canvas to lay down a shape; shapes paint back to front. Subjects are modelled in light and get smaller
+    brushes and thicker paint. The painting runs on your device (in a Web Worker) and takes a few seconds.
+    <a href="https://github.com/StevenKauwe/brushwork">Source on GitHub</a> (MIT).
+  </footer>
+</main>
+<script type="module">
+  import init, { app_start } from "./brushwork_web.js";
+  init().then(() => app_start()).catch((e) => {
+    document.getElementById("status").textContent = "Could not start the painter: " + e;
+  });
+</script>
+</body>
+</html>
