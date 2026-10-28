@@ -61,7 +61,12 @@ jobs:
       - name: No relaxed SIMD (iPhone WebKit rejects it)
         run: wasm-tools validate --features=-relaxed-simd dist/brushwork_web_bg.wasm
       - name: WebKitGTK (the iPhone's engine), its WebDriver and a virtual display
-        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends webkit2gtk-driver libwebkit2gtk-4.1-0 libgl1-mesa-dri xvfb xauth dbus-x11
+        # The WebDriver package is webkitgtk-webdriver since Ubuntu 26.04 (webkit2gtk-driver before).
+        run: |
+          sudo apt-get update -q
+          pkgs="libwebkit2gtk-4.1-0 libgl1-mesa-dri xvfb xauth dbus-x11"
+          sudo apt-get install -yq --no-install-recommends webkitgtk-webdriver $pkgs \
+            || sudo apt-get install -yq --no-install-recommends webkit2gtk-driver $pkgs
       - run: cargo build --release --locked -p webcheck
       - name: The page paints in WebKit (desktop size)
         run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --shot dist-shot-desktop.png
