@@ -1525,11 +1525,12 @@ fn clip_seed(abs_frame: u32, every: u32) -> u32 {
 
 /// One frame, painted and lit, as 8-bit RGB (WIDTH x HEIGHT).
 pub fn paint_frame(film: &Film, t: f64, seed: u32) -> Vec<u8> {
-    let t0 = std::time::Instant::now();
+    // (no clock unless asked for: there is none on wasm32-unknown-unknown)
+    let t0 = timing().then(std::time::Instant::now);
     let p = paint_frame_painting(film, t, seed);
-    let t1 = std::time::Instant::now();
+    let t1 = timing().then(std::time::Instant::now);
     let px = p.lit();
-    if timing() {
+    if let (Some(t0), Some(t1)) = (t0, t1) {
         eprintln!("TIMING frame {:.3} s painted (planning + strokes), {:.3} s lit", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
     }
     px
@@ -1560,7 +1561,6 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
         p.rec = Some(Box::new(gpu::Recorder::new(p.col.clone())));
     }
     p.view = cam.map_or(1.0, |c| c.zoom as f32).clamp(0.25, 6.0);
-    let t0 = std::time::Instant::now();
     // what is being looked at: the film's subjects (its outlined, smaller shapes), as one group
     if LIGHT.load(Ordering::Relaxed) {
         let (mut sum, mut wsum) = ([0.0f32; 2], 0.0f32);
@@ -1606,7 +1606,12 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
         }
     }
     let total = rec.items.len().max(1) as f32;
+    let progress = PROGRESS.with(|p| p.get());
+    let n_items = rec.items.len().max(1) as f32;
     for (i, it) in rec.items.iter().enumerate() {
+        if let Some(f) = progress {
+            f(i as f32 / n_items);
+        }
         let (pts, zoom) = screen(it, cam);
         ZOOM.with(|z| z.set(zoom));
         let _ = total;
@@ -1959,12 +1964,20 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
             Kind::Glow { .. } => {}
         }
     }
-    let _ = t0;
     if std::env::var("OIL_DBG").is_ok() {
         eprintln!("t {t:.3} zoom {:.3} strokes {}", cam.map_or(1.0, |c| c.zoom), p.strokes);
     }
     finish(&mut p);
     p
+}
+
+thread_local! {
+    static PROGRESS: std::cell::Cell<Option<fn(f32)>> = const { std::cell::Cell::new(None) };
+}
+/// Have `paint_frame` on this thread call `f` with how far through the frame's shapes it is (0 to 1), before each
+/// shape: for a progress bar. It doesn't change the painting.
+pub fn set_progress(f: Option<fn(f32)>) {
+    PROGRESS.with(|p| p.set(f));
 }
 
 /// `OIL_TIMING=1` prints where each frame's time goes.
@@ -1978,9 +1991,9 @@ fn finish(p: &mut Painting) {
     if let Some(r) = p.rec.take() {
         #[cfg(feature = "gpu")]
         {
-            let t0 = std::time::Instant::now();
+            let t0 = timing().then(std::time::Instant::now);
             let (col, thick) = gpu::render(&r);
-            if timing() {
+            if let Some(t0) = t0 {
                 eprintln!("TIMING gpu {:.3} s ({} strokes, {:.0} MB of masks)", t0.elapsed().as_secs_f64(), r.cmds.len(), r.masks.len() as f64 * 4e-6);
             }
             p.col = col;

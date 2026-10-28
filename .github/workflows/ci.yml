@@ -8,8 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  # No extra CPU features: iPhone WebKit rejects relaxed SIMD.
+  RUSTFLAGS: ""
 
 jobs:
   check:
@@ -32,3 +38,64 @@ jobs:
         run: cargo test --workspace --locked --release --features brushwork/gpu --no-run
       - name: the CPU path builds for wasm32
         run: cargo check --locked --target wasm32-unknown-unknown -p brushwork -p brushwork-kit -p brushwork-paint
+      - name: clippy (the canvas page, wasm32)
+        run: cargo clippy --locked --target wasm32-unknown-unknown -p brushwork-web -- -D warnings
+
+  web:
+    name: canvas page (build, relaxed-SIMD check, WebKit smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (the version, targets and components in rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - name: wasm-bindgen version from Cargo.lock
+        id: wb
+        run: echo "version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[^0-9.]/, ""); print; exit }' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }},wasm-tools
+      - run: tools/build-web.sh
+      - name: No relaxed SIMD (iPhone WebKit rejects it)
+        run: wasm-tools validate --features=-relaxed-simd dist/brushwork_web_bg.wasm
+      - name: WebKitGTK (the iPhone's engine), its WebDriver and a virtual display
+        # The WebDriver package is webkitgtk-webdriver since Ubuntu 26.04 (webkit2gtk-driver before).
+        run: |
+          sudo apt-get update -q
+          pkgs="libwebkit2gtk-4.1-0 libgl1-mesa-dri xvfb xauth dbus-x11"
+          sudo apt-get install -yq --no-install-recommends webkitgtk-webdriver $pkgs \
+            || sudo apt-get install -yq --no-install-recommends webkit2gtk-driver $pkgs
+      - run: cargo build --release --locked -p webcheck
+      - name: The page paints in WebKit (desktop size)
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --shot dist-shot-desktop.png
+      - name: The page paints in WebKit (phone size, iPhone user agent)
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --phone --shot dist-shot-phone.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webkit-screenshots
+          path: dist-shot-*.png
+          if-no-files-found: ignore
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: deploy the canvas page to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, web]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

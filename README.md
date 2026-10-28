@@ -8,6 +8,10 @@ shape keeps its brushwork from frame to frame, and only moves where the shape mo
 
 It is the painter behind the oil-painted films in music-to-movie-magic and CrabScape's oil-painted art.
 
+**Try it:** [the canvas page](https://stevenkauwe.github.io/brushwork/). Draw flat shapes with a finger or the
+mouse, then press Paint. The engine runs in your browser, compiled to WebAssembly in a Web Worker. It paints the
+1024 x 576 canvas in about a second on a desktop.
+
 ## Crates
 
 | crate | what it is |
@@ -16,6 +20,8 @@ It is the painter behind the oil-painted films in music-to-movie-magic and CrabS
 | [`brushwork-paint`](crates/brushwork-paint) | the shape recorder a film's shots draw with (`Rec`: paint, ink lines, glows, camera), `Film`/`Shot`, look presets, transitions |
 | [`brushwork-kit`](crates/brushwork-kit) | the brush kit: time, easing, motion, geometry, colour, and the spectral pigment mixer |
 | [`tools/flickscan`](tools/flickscan) | finds flickering strokes in a rendered frame sequence |
+| [`brushwork-web`](crates/brushwork-web) | the canvas page (wasm-bindgen + web-sys); `tools/build-web.sh` builds it into `dist/` |
+| [`tools/webcheck`](tools/webcheck) | opens the page in WebKit or Chromium through WebDriver and checks it paints |
 
 ## Use
 
