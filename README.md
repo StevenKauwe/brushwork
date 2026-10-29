@@ -72,7 +72,8 @@ from a flicker that was once seen in a film:
 - `a_strokes_edge_direction_never_flips_between_two_equally_near_edges`, `a_shape_that_swells_a_little_keeps_its_brushwork`
 - `an_outline_that_flexes_keeps_its_sweeps`, `a_small_shape_growing_through_every_size_threshold_never_pops`
 - `level_strokes_end_raggedly_not_on_a_vertical_seam`, `same_shape_same_place_paints_identically`
-- `a_fade_fades_and_leaves_without_a_pop`, `a_translucent_wash_is_mixed_down_not_glazed_in_streaks`, ...
+- `a_fade_fades_and_leaves_without_a_pop`, `a_translucent_wash_is_mixed_down_not_glazed_in_streaks`
+- `a_strap_widening_from_a_line_to_an_area_never_pops`, `close_thin_strips_stay_apart`, ...
 
 `cargo test --release` runs them on the CPU; `OIL_TEST_BACKEND=gpu cargo test --release --features brushwork/gpu`
 runs them on the GPU. For a rendered film, `flickscan <dir> <first> <last>` lists any block that changes for a frame
