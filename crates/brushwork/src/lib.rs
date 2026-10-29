@@ -126,6 +126,26 @@ fn is_cast(family: &str) -> bool {
     style().cast.iter().any(|c| family.starts_with(c))
 }
 
+/// The softness of scenery with nothing said about its distance.
+const MID_SOFT: f32 = 0.3;
+/// How far back a family sits, as a painter treats it: 0 for the subjects (crisp edges, lively broken colour),
+/// rising through the middle distance to 1 for the far distance and the sky (worked wet into wet, edges lost,
+/// strokes close in value). From the style's distance bands when it has them, else from its cast and airy families.
+fn softness(family: &str) -> f32 {
+    if is_cast(family) {
+        return 0.0;
+    }
+    match style().bands.map(|f| f(family)) {
+        Some(Band::Subject) => 0.0,
+        Some(Band::Near) => 0.15,
+        Some(Band::Mid) => MID_SOFT,
+        Some(Band::Far) => 0.7,
+        Some(Band::Sky) => 1.0,
+        None if style().airy.iter().any(|a| family.starts_with(a)) => 1.0,
+        None => MID_SOFT,
+    }
+}
+
 /// The canvas: every painting is 1920 x 1080.
 pub const WI: usize = 1920;
 pub const HI: usize = 1080;
@@ -178,6 +198,9 @@ pub struct Painting {
     pub flat: Vec<[f32; 3]>,
     /// Paint thickness.
     pub thick: Vec<f32>,
+    /// How much of the plain picture is paint rather than the bare toned ground (0 to 1): a brush can only work
+    /// wet paint into its own, never the canvas's ground.
+    wet: Vec<f32>,
     /// Strokes laid so far.
     pub strokes: u32,
     /// With a recorder, strokes are planned and written down for the GPU instead of laid (see gpu.rs).
@@ -247,7 +270,14 @@ impl Painting {
                 };
             }
         }
-        Painting { flat: col.clone(), col, thick: vec![0.0; WI * HI], strokes: 0, rec: None, view: 1.0 }
+        Painting { flat: col.clone(), col, thick: vec![0.0; WI * HI], wet: vec![0.0; WI * HI], strokes: 0, rec: None, view: 1.0 }
+    }
+
+    /// The same canvas with its paint layers replaced (for tests).
+    #[cfg(test)]
+    fn with_layers(col: Vec<[f32; 3]>, flat: Vec<[f32; 3]>, thick: Vec<f32>) -> Painting {
+        let wet = vec![1.0; col.len()];
+        Painting { col, flat, thick, wet, strokes: 0, rec: None, view: 1.0 }
     }
 
     /// One stroke. `mask` (with its origin and size) limits it softly to a shape.
@@ -308,7 +338,9 @@ impl Painting {
             // how it was put on
             Tool::Flat => (0.26 * BODY, 0.6 * BODY, 1.2),
             Tool::Filbert => (0.2 * BODY, 0.5 * BODY, 2.2),
-            Tool::Round => (0.07 * BODY, 0.2 * BODY, 1.4),
+            // a fine round loaded with paint (a rigger) leaves a line with clean sides: its soft margin shrinks with
+            // the line, so a thin line stays a line and two close ones stay two
+            Tool::Round => (0.07 * BODY, 0.2 * BODY, (0.55 + 0.14 * s.width).min(1.4)),
             Tool::Knife => (0.0, 1.1 * BODY, 0.8),
         };
         // the whole stroke's length (a piece of a sweep knows its share of it), and how far in from its ends the
@@ -633,6 +665,9 @@ thread_local! {
     /// DEPTH v2: the band of the shape being painted, and the frame's atmospheric veil hue (its own early sky).
     static BAND: std::cell::Cell<Band> = const { std::cell::Cell::new(Band::Mid) };
     static VEIL: std::cell::Cell<[f32; 3]> = const { std::cell::Cell::new([0.5, 0.55, 0.65]) };
+    /// How far back the shape being painted sits, as a painter treats it (see `softness`): 0 the focal subject,
+    /// 1 the far distance and the sky.
+    static SOFT: std::cell::Cell<f32> = const { std::cell::Cell::new(MID_SOFT) };
     // one frame is painted start to finish on one thread
     static SCENE: std::cell::Cell<Option<Scene>> = const { std::cell::Cell::new(None) };
 }
@@ -747,6 +782,13 @@ fn shifted(c: [f32; 3], k: f32, warm: f32) -> [f32; 3] {
 
 /// A shape's soft coverage over its bounding box, grown a little so strokes may cross its edge.
 fn shape_mask(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [usize; 2])> {
+    shape_mask_with(pts, grow, None)
+}
+
+/// As `shape_mask`, with lost and found edges: `lost(i)` says, for the canvas pixel `i` just outside the shape,
+/// how far the shape's edge is lost there (0 found: the strokes stop crisply at the edge; 1 lost: they run on
+/// past it, over the grown margin, into the paint of the same value beyond).
+fn shape_mask_with(pts: &[[f32; 2]], grow: f32, lost: Option<&dyn Fn(usize) -> f32>) -> Option<(Vec<f32>, [i32; 2], [usize; 2])> {
     let pad = grow.ceil() as i32 + 2;
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for p in pts {
@@ -836,8 +878,26 @@ fn shape_mask(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [usize
             }
         }
     }
-    for v in &mut m {
-        *v = smooth(0.22, 0.5, *v);
+    match lost {
+        None => {
+            for v in &mut m {
+                *v = smooth(0.22, 0.5, *v);
+            }
+        }
+        Some(lost) => {
+            for y in 0..sz[1] {
+                for x in 0..sz[0] {
+                    let v = &mut m[y * sz[0] + x];
+                    // (inside the shape the blurred coverage is at least one half: only the margin is judged)
+                    if *v > 0.0 && *v < 0.5 {
+                        let l = lost((y + o[1] as usize) * WI + x + o[0] as usize);
+                        *v = smooth(0.44 - 0.3 * l, 0.5, *v);
+                    } else {
+                        *v = smooth(0.22, 0.5, *v);
+                    }
+                }
+            }
+        }
     }
     Some((m, o, sz))
 }
@@ -845,14 +905,15 @@ fn shape_mask(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [usize
 #[allow(clippy::too_many_arguments)]
 /// The strokes a shape is laid with: (slot centre, stroke id, how much of it is laid 0..1). `c` is the shape's
 /// centroid, `lo`/`hi` its bounding box clipped to the canvas, `base` the brushwork's direction.
-fn plan_slots(pts: &[[f32; 2]], c: [f32; 2], lo: [f32; 2], hi: [f32; 2], width: f32, base: f32, seed: u32) -> Vec<([f32; 2], u32, f32)> {
+/// `long` (1 or more) stretches the lattice along the brushwork, for strokes that many times longer.
+fn plan_slots(pts: &[[f32; 2]], c: [f32; 2], lo: [f32; 2], hi: [f32; 2], width: f32, base: f32, seed: u32, long: f32) -> Vec<([f32; 2], u32, f32)> {
     let vis = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
     let mid = c;
-    let (step_u, step_v) = (width * 1.35, width * 0.42);
+    let (step_u, step_v) = (width * 1.35 * long, width * 0.42);
     let (sn, cs) = base.sin_cos();
-    // a stroke reaches up to about 4.3 brush widths from its slot: every slot that could touch the visible part
-    // is visited and kept, so none appears or disappears as the canvas edge slides along the shape
-    let reach = 4.5 * width;
+    // a stroke reaches up to about 4.3 brush widths (times `long`) from its slot: every slot that could touch the
+    // visible part is visited and kept, so none appears or disappears as the canvas edge slides along the shape
+    let reach = 4.5 * width * long;
     let rad = (hi[0] - lo[0]).hypot(hi[1] - lo[1]) / 2.0 + reach;
     let (du, dv) = ((vis[0] - c[0]) * cs + (vis[1] - c[1]) * sn, -(vis[0] - c[0]) * sn + (vis[1] - c[1]) * cs);
     let (cu, cv) = ((du / step_u).round() as i32, (dv / step_v).round() as i32);
@@ -955,6 +1016,97 @@ fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32, none: [f32; 3]) -> [f32
     std::array::from_fn(|k| sum[k] + (none[k] - sum[k]) * w)
 }
 
+/// How much of the plain picture around (x, y) is paint (not the bare ground), over the same patch `flat_under`
+/// averages.
+fn wet_under(wet: &[f32], x: f32, y: f32, r: f32) -> f32 {
+    let r = r.max(1.0);
+    let at = |x: f32, y: f32| -> f32 {
+        let (x, y) = (x.clamp(0.0, WI as f32 - 1.0), y.clamp(0.0, HI as f32 - 1.0));
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(WI - 1), (y0 + 1).min(HI - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        (wet[y0 * WI + x0] * (1.0 - fx) + wet[y0 * WI + x1] * fx) * (1.0 - fy) + (wet[y1 * WI + x0] * (1.0 - fx) + wet[y1 * WI + x1] * fx) * fy
+    };
+    let mut sum = 0.0;
+    for j in -1..=1 {
+        for i in -1..=1 {
+            sum += at(x + i as f32 * r, y + j as f32 * r) / 9.0;
+        }
+    }
+    sum
+}
+
+/// Two paints mixed as pigments (Kubelka-Munk): `f` of `b` worked into `a`.
+fn pigment_mix(a: [f32; 3], b: [f32; 3], f: f32) -> [f32; 3] {
+    if f <= 0.0 {
+        return a;
+    }
+    let d = |c: [f32; 3]| [c[0] as f64, c[1] as f64, c[2] as f64];
+    let (ka, kb) = (brushwork_kit::spectral::ks(d(a)), brushwork_kit::spectral::ks(d(b)));
+    let f = f.min(1.0) as f64;
+    let mixed: [f64; 38] = std::array::from_fn(|i| ka[i] * (1.0 - f) + kb[i] * f);
+    let rgb = brushwork_kit::spectral::colour(&mixed).0;
+    [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32]
+}
+
+/// How different two paints look, as a painter judging an edge does: mostly by value, partly by hue.
+fn contrast(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+    let hue = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    (lum(a) - lum(b)).abs() + 0.35 * hue
+}
+
+/// A shape's breadth, as a painter sizing a brush judges it: the widest part of it, the largest circle that fits
+/// inside (found on a grid over its box and refined), never less than its mean breadth (its area over half its
+/// outline's length, a strip's width), never more than its bounding box's short side. A thin twig lying on the
+/// slant is thin; a crescent is as broad as its belly, not its hair-thin horns.
+fn thickness(pts: &[[f32; 2]]) -> f32 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    let (mut area, mut perim) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        for k in 0..2 {
+            lo[k] = lo[k].min(a[k]);
+            hi[k] = hi[k].max(a[k]);
+        }
+        area += a[0] * b[1] - b[0] * a[1];
+        perim += (b[0] - a[0]).hypot(b[1] - a[1]);
+    }
+    let small = (hi[0] - lo[0]).min(hi[1] - lo[1]);
+    let mean = area.abs() / perim.max(1e-3);
+    // (the grid hangs on the shape's own box, so a shape that only moves keeps exactly its breadth)
+    const G: usize = 12;
+    let mut best = (0.0f32, [0.0f32; 2]);
+    for j in 0..G {
+        for i in 0..G {
+            let q = [lo[0] + (i as f32 + 0.5) / G as f32 * (hi[0] - lo[0]), lo[1] + (j as f32 + 0.5) / G as f32 * (hi[1] - lo[1])];
+            let d = signed_depth(pts, q, f32::MAX);
+            if d > best.0 {
+                best = (d, q);
+            }
+        }
+    }
+    if best.0 > 0.0 {
+        let mut step = [(hi[0] - lo[0]) / G as f32 * 0.5, (hi[1] - lo[1]) / G as f32 * 0.5];
+        for _ in 0..8 {
+            let from = best;
+            for (dx, dy) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)] {
+                let q = [from.1[0] + dx * step[0], from.1[1] + dy * step[1]];
+                let d = signed_depth(pts, q, f32::MAX);
+                if d > best.0 {
+                    best = (d, q);
+                }
+            }
+            step = [step[0] * 0.5, step[1] * 0.5];
+        }
+    }
+    small.min(mean.max(2.0 * best.0))
+}
+
 /// Whether a shape covers the whole canvas (a full-frame overlay): the canvas's corners are inside it and none of
 /// its outline runs through the canvas.
 fn covers_canvas(pts: &[[f32; 2]]) -> bool {
@@ -987,6 +1139,7 @@ fn glaze(p: &mut Painting, c: [f32; 3], k: f32) {
             for q in 0..3 {
                 p.flat[i][q] += (c[q] - p.flat[i][q]) * k;
             }
+            p.wet[i] += (1.0 - p.wet[i]) * k;
         }
         return;
     }
@@ -995,6 +1148,7 @@ fn glaze(p: &mut Painting, c: [f32; 3], k: f32) {
             p.col[i][q] += (c[q] - p.col[i][q]) * k;
             p.flat[i][q] += (c[q] - p.flat[i][q]) * k;
         }
+        p.wet[i] += (1.0 - p.wet[i]) * k;
         p.thick[i] *= 1.0 - k;
     }
 }
@@ -1043,9 +1197,25 @@ fn paint_form_band(
     // part is off the canvas), and in steps, so a shape that swells a little keeps the same brush.
     let small = (hi[0] - lo[0]).min(hi[1] - lo[1]);
     let z = zoom();
+    // The brush goes by how broad the shape really is, not its bounding box: a thin twig lying on the slant is
+    // painted with a thin brush, not one as wide as its box. (With the box, a 3 px diagonal twig got a 37 px brush
+    // spilling 10 px either side, and close twigs, straps and whiskers ran together into one smear.)
+    let thick = thickness(pts);
+    // how far the shape is a line rather than an area (by degrees: a shape thinning through it changes by degrees)
+    let thin_k = 1.0 - smooth(1.2 * SMALLEST * z, 2.5 * SMALLEST * z, thick);
     // The brush follows the shape's size continuously. (It used to snap to steps of 1.22x: a shape that swelled
     // across a step boundary, or a blinking eye, re-planned every stroke in it in one frame, which read as a pop.)
-    let width = (small / z * 0.30 * detail).clamp(5.0, 110.0) * z;
+    let width = (thick / z * 0.30 * detail).clamp(5.0, 110.0) * z;
+    // How far back the shape sits (see `softness`). A shape that stands out strongly from the paint it is laid on
+    // (a moon in the night sky, a light window in a dark wall) is an accent however far away it is, and is painted
+    // as crisply and as lively as a subject.
+    let far = SOFT.with(|s| s.get());
+    let soft = {
+        let s = far;
+        let r = (thick * 0.3).max(2.0 * z);
+        let behind = flat_under(&p.flat, c[0], c[1], r, col);
+        s * (1.0 - smooth(0.16, 0.36, contrast(col, behind)) * wet_under(&p.wet, c[0], c[1], r))
+    };
     lo = [lo[0].max(-80.0), lo[1].max(-80.0)];
     hi = [hi[0].min(WI as f32 + 80.0), hi[1].min(HI as f32 + 80.0)];
     if hi[0] <= lo[0] || hi[1] <= lo[1] {
@@ -1073,17 +1243,49 @@ fn paint_form_band(
         // fraction of a degree per frame is the shape's own motion, which the brushwork should follow.
         diag + to * smooth(1.35, 2.1, stretch)
     };
-    let Some((mask, o, sz)) = shape_mask(pts, width * 0.22 + 1.5 * z) else { return };
+    // A long thin shape is one pull of the brush along its length, not a row of short dabs: its strokes (and the
+    // lattice they hang on) stretch with how long and thin it is.
+    // Only a straight one: a curved strap is followed by shorter strokes turning with its edge (one long straight
+    // stroke would cut across the curve and leave it half bare). A straight strip's breadth across its axis is
+    // its true breadth; a curved one's is much more.
+    let straight = {
+        let t = ((sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy).sqrt();
+        let across = 2.0 * ((sxx + syy - t) / 2.0 / n).max(0.0).sqrt();
+        smooth(0.45, 0.8, thick / across.max(1e-3))
+    };
+    let long = 1.0 + thin_k * straight * smooth(2.5, 6.0, stretch) * (stretch / 3.0).min(5.0);
+    // The strokes may cross the shape's edge only a little: enough that it is not cut with scissors, never a soft
+    // halo of its colour around it (they used to reach a fifth of a brush out, up to 25 px, an airbrushed glow
+    // round every big shape), and nothing beyond a thin shape's own breadth.
+    // Where the edge is found the strokes stop at it; where it is lost they run on into the neighbouring paint
+    // (the margin is judged pixel by pixel against the plain picture, see `shape_mask_with`), further in the
+    // distance. (They used to reach a fifth of a brush out everywhere, up to 25 px: an airbrushed glow of its colour
+    // round every big shape, however strongly it stood out.)
+    let grow = width * (0.22 + 0.12 * soft) * (1.0 - thin_k) + (1.5 - 0.8 * thin_k) * z;
+    let (flat, wet) = (&p.flat, &p.wet);
+    let (lo_c, hi_c) = (0.05 + 0.06 * soft, 0.22 + 0.1 * soft);
+    // (and a light far off in the dark, a moon or a lamp, spreads a little of its light round it: halation)
+    let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+    let lost = |i: usize| {
+        let glow = 0.7 * far * smooth(0.2, 0.45, lum(col) - lum(flat[i]));
+        ((1.0 - smooth(lo_c, hi_c, contrast(col, flat[i]))) * (0.5 + 0.5 * wet[i])).max(glow)
+    };
+    let Some((mask, o, sz)) = shape_mask_with(pts, grow.max(1.0), Some(&lost)) else { return };
     // the grid of strokes hangs on the shape's own centre, so it travels with the shape (and a big shape half off
     // the canvas keeps its strokes where they were)
     // A slot's identity is its lattice index (iu, iv) counted from the shape's own centroid, so it never depends
     // on which slots are visited. Only the visiting WINDOW follows the visible part of the shape (a big shape
     // half off the canvas, an iris wedge or a whip streak reaching 4000 px out, has its centroid far away; a
     // window centred on the centroid with the clipped radius missed the visible part entirely).
-    let mut spots = plan_slots(pts, c, lo, hi, width, base, seed);
+    let mut spots = plan_slots(pts, c, lo, hi, width, base, seed, long);
     spots.sort_by_key(|(_, id, _)| h32(*id));
     if trace() {
-        eprintln!("  FORM seed={seed:08x} n={} width={width:.3} base={base:.4} c=({:.2},{:.2})", spots.len(), c[0], c[1]);
+        eprintln!(
+            "  FORM seed={seed:08x} n={} width={width:.3} base={base:.4} c=({:.2},{:.2}) thick={thick:.1} long={long:.2} soft={soft:.2}",
+            spots.len(),
+            c[0],
+            c[1]
+        );
         for (q, id, e) in &spots {
             eprintln!("    SPOT {id:08x} ({:.1},{:.1}) e={e:.4}", q[0], q[1]);
         }
@@ -1109,9 +1311,19 @@ fn paint_form_band(
         while turn_to < -std::f32::consts::FRAC_PI_2 {
             turn_to += std::f32::consts::PI;
         }
-        let pull = (-(near / (width * 1.6)).powi(2)).exp();
+        // A form being modelled is brushed round its edges; a flat plane of scenery is blocked in calmly in one
+        // direction and only turns right at its edge. (The turn used to reach 1.6 brush widths in, up to 180 px:
+        // every stroke of a big flat shape swung towards some edge and they crossed in a hatch all over it.)
+        let calm = 1.0 - form.clamp(0.0, 1.0);
+        let pull = (-(near / (width * (1.6 - 1.0 * calm))).powi(2)).exp();
         let swirl = drift + turn_to * pull;
-        let k = 0.94 + 0.12 * hf(id, 4);
+        // Broken colour, the way a painter remixes as they go: value and warmth drift slowly across the area, and
+        // each stroke differs a little from its neighbour. Lively on a subject, close in value in the distance (a
+        // random jump from every stroke to the next made skies and big shapes a patchwork of dabs).
+        let lively = 1.0 - soft;
+        let field = |s: u32| noise((q[0] - c[0]) / (2.8 * width), (q[1] - c[1]) / (2.8 * width), seed ^ s) - 0.5;
+        let k = 1.0 + 0.10 * field(0xB0) + 0.12 * (hf(id, 4) - 0.5) * (0.3 + 0.7 * lively);
+        let warm = 1.6 * field(0xB1) + 2.0 * (hf(id, 8) - 0.5) * (0.25 + 0.75 * lively);
         // which side of the form this stroke is on
         let lit_col = match scene() {
             Some(sc) => {
@@ -1120,25 +1332,56 @@ fn paint_form_band(
             }
             None => col,
         };
+        // Wet into wet. Near its edge a stroke works in the wet paint it meets there: where the two colours are
+        // close in value the edge is lost in the blend, where they contrast it stays found; in the distance more is
+        // blended, so backgrounds fuse. Deep inside a shape the brush carries its own fresh paint: it no longer
+        // drags the colour of whatever lies behind the shape through it (an ochre shape on a blue sky came out
+        // streaked green), and a thin shape, a rigger's line, takes nothing from its neighbours at all.
+        let edge_wet = (-(near / (width * 1.1)).powi(2)).exp() * (1.0 - thin_k);
+        let (mut own, mut own_alt) = (shifted(lit_col, k, warm), shifted(alt, 1.0, 0.0));
+        // what the brush works into is the paint where it lays, at its middle (a stroke laid inwards from just
+        // outside a shape used to load up at its start with whatever lay beyond the edge, often the bare ground)
+        let picked = flat_under(&p.flat, q[0], q[1], width * 0.3, col);
+        let scumble = {
+            let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+            let chroma = col.iter().fold(0.0f32, |m, v| m.max(*v)) - col.iter().fold(1.0f32, |m, v| m.min(*v));
+            0.45 + 0.55 * smooth(0.12, 0.35, lum(col) - lum(picked)) * (1.0 - smooth(0.15, 0.4, chroma))
+        };
+        let mut lost = 0.0;
+        if edge_wet > 0.01 {
+            let r = width * 0.5;
+            let wet = wet_under(&p.wet, q[0], q[1], r);
+            let under = flat_under(&p.flat, q[0], q[1], r, col);
+            lost = 1.0 - smooth(0.05 + 0.06 * soft, 0.22 + 0.1 * soft, contrast(col, under));
+            let blend = edge_wet * wet * lost * (0.14 + 0.3 * soft);
+            if blend > 0.004 {
+                own = pigment_mix(own, under, blend);
+                own_alt = pigment_mix(own_alt, under, blend);
+            }
+        }
         p.stroke(
             &Stroke {
                 c: q,
                 angle: base + swirl,
                 // (a little longer than the paint it lays: its bristles land and lift a way in from its ends)
-                len: width * (3.6 + 3.6 * hf(id, 5)) * (1.0 - 0.35 * pull),
+                len: width * (3.6 + 3.6 * hf(id, 5)) * (1.0 - 0.35 * pull) * long,
                 width: width * (0.75 + 0.5 * hf(id, 6)),
                 // strokes are arcs from the wrist: mostly bowed the same way, never ruler-straight
-                bend: 0.12 + (hf(id, 7) - 0.5) * 0.2,
-                col: shifted(lit_col, k, (hf(id, 8) - 0.5) * 2.0),
-                alt: shifted(alt, 1.0, 0.0),
+                bend: (0.12 + (hf(id, 7) - 0.5) * 0.2) / long,
+                col: own,
+                alt: own_alt,
                 opacity: opacity * (0.86 + 0.12 * hf(id, 9)) * edge_k,
-                pickup: (0.22 + 0.3 * hf(id, 10) + pickup_add).min(0.85),
+                // (a found edge is cut in cleanly; where it is lost the brush drags the neighbour in; deep inside, a
+                // light, quiet paint scumbled over darker paint drags its tone up into broken texture, as a moon's
+                // pale paint over the night sky does, but a strong colour over another is kept clean of the mud)
+                pickup: ((0.22 + 0.3 * hf(id, 10)) * (scumble + (1.0 - scumble) * edge_wet * (0.3 + 0.7 * lost)) * (1.0 - 0.85 * thin_k) + pickup_add)
+                    .min(0.85),
                 load: (0.6 + 0.4 * hf(id, 11)) * body,
                 // the stroke's bristles belong to its place on its shape, not to how many strokes came before it
                 part: Some((h32(id) >> 2, true, true)),
                 span: (0.0, 1.0),
                 tool,
-                picked: None,
+                picked: Some(picked),
                 along: 0.0,
             },
             Some((&mask, o, sz)),
@@ -1152,19 +1395,55 @@ fn paint_form_band(
             if mask[y * sz[0] + x] >= 0.5 {
                 let (px, py) = (x as i32 + o[0], y as i32 + o[1]);
                 if px >= 0 && py >= 0 && (px as usize) < WI && (py as usize) < HI {
-                    let f = &mut p.flat[py as usize * WI + px as usize];
+                    let j = py as usize * WI + px as usize;
+                    let f = &mut p.flat[j];
                     *f = std::array::from_fn(|k| f[k] + (col[k] - f[k]) * premix);
+                    p.wet[j] += (1.0 - p.wet[j]) * premix;
                 }
             }
         }
     }
-    // the cut-in edge comes in by degrees as a shape grows past the size that has one
-    let contour_k = smooth(SMALLEST * 3.5 * z, SMALLEST * 4.5 * z, small);
+    // the cut-in edge comes in by degrees as a shape grows past the size that has one (by its true breadth: a
+    // thin shape has no room for a band cut in along each side)
+    let contour_k = smooth(SMALLEST * 3.5 * z, SMALLEST * 4.5 * z, thick);
     if contour_k > 0.001 && contour {
         let _contour = Fade::set(contour_k);
-        paint_contour(p, pts, col, alt, (width * 0.45).clamp(SMALLEST * z, 26.0 * z), seed ^ 0xC0, opacity, body);
+        // lost and found: a modelled subject keeps much of its cut-in edge everywhere; scenery only where it
+        // meets a contrasting value, and less the further back it is
+        let keep = 0.6 * smooth(0.5, 1.0, form);
+        paint_contour(p, pts, col, alt, (width * 0.45).clamp(SMALLEST * z, 26.0 * z), seed ^ 0xC0, opacity, body, keep, soft);
     }
 }
+
+/// How strongly an edge of a shape of colour `col` is stated at `q` (0 lost, 1 found), going by the contrast
+/// between the shape and what is just outside it there (the plain picture `reach` px to either side of the edge;
+/// one side is the shape itself). `keep` is the least it is stated where the two meet in the same value; the
+/// further back (`soft`), the more contrast an edge needs to be found.
+fn found_edge(p: &Painting, col: [f32; 3], q: [f32; 2], t: [f32; 2], reach: f32, keep: f32, soft: f32) -> f32 {
+    let nrm = [-t[1], t[0]];
+    let r = (reach * 0.4).max(1.0);
+    let a = flat_under(&p.flat, q[0] + nrm[0] * reach, q[1] + nrm[1] * reach, r, col);
+    let b = flat_under(&p.flat, q[0] - nrm[0] * reach, q[1] - nrm[1] * reach, r, col);
+    let d = contrast(col, a).max(contrast(col, b));
+    keep + (1.0 - keep) * smooth(0.06 + 0.08 * soft, 0.24 + 0.12 * soft, d)
+}
+
+/// How the hand moves along a path (see `hand_paths`).
+#[derive(Clone, Copy)]
+struct Hand {
+    /// The least length of path one load of paint lasts (px, seen through the camera); otherwise 15.5 widths.
+    reach: f32,
+    /// How far the hand wanders either side of the line (a share of the brush's width, at most 14 px of it), and
+    /// the least length over which it wanders (px): a slow drift of the arm, not a tremble.
+    wander: f32,
+    wave: f32,
+}
+/// Cutting in and outlining a shape: a load per short sweep, the hand drifting about half a brush either side.
+const HAND_OUTLINE: Hand = Hand { reach: 0.0, wander: 0.5, wave: 0.0 };
+/// A drawn line, with a rigger: long hairs that hold enough paint for one long confident pull, a hand that drifts
+/// only slowly and a little. (A 4 px line used to take a fresh load and a fresh taper every 60 px and wobble a px
+/// or two every 30 px, so a long line read as a string of beads and close parallel lines kept touching.)
+const HAND_LINE: Hand = Hand { reach: 260.0, wander: 0.22, wave: 90.0 };
 
 /// How a hand takes a brush along an outline. Not side by side with a ruler:
 /// * the brush lifts at a sharp corner and starts again;
@@ -1175,7 +1454,7 @@ fn paint_form_band(
 /// * it runs a little past where it meant to stop, and wanders a little either side of the line.
 ///
 /// Returns each stroke's path (closely spaced points), the share of it to lay (1 = all), and its stable identity.
-fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32) -> Vec<(Vec<[f32; 2]>, f32, u32)> {
+fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32, hand: Hand) -> Vec<(Vec<[f32; 2]>, f32, u32)> {
     let n = pts.len();
     if n < 2 {
         return vec![];
@@ -1246,7 +1525,8 @@ fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32
                 if i > 0 {
                     walked += (curve[i][0] - curve[i - 1][0]).hypot(curve[i][1] - curve[i - 1][1]);
                 }
-                let wander = (noise(walked / (width * 8.0), pi as f32 * 9.1, seed) - 0.5) * 0.5 * width.min(14.0 * zoom());
+                let wave = (width * 8.0).max(hand.wave * zoom());
+                let wander = (noise(walked / wave, pi as f32 * 9.1, seed) - 0.5) * hand.wander * width.min(14.0 * zoom());
                 let nrm = [-(q[1] - p[1]) / l, (q[0] - p[0]) / l];
                 let off = offset * side + wander;
                 [curve[i][0] + nrm[0] * off, curve[i][1] + nrm[1] * off]
@@ -1259,7 +1539,7 @@ fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32
         // the piece reaches past its mark). (The sweeps used to be cut greedily, "until this much length or this
         // much turn": a shape that flexed a little re-cut every sweep after the change, and since each sweep was
         // seeded by its place in the list, re-seeded them all; the outline of a breathing owl flickered.)
-        let unit = 15.5 * width;
+        let unit = (15.5 * width).max(hand.reach * zoom());
         let mut cost = vec![0.0f32; m];
         let mut arc = vec![0.0f32; m];
         for q in 1..m {
@@ -1329,6 +1609,9 @@ fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32
     out
 }
 
+/// How strongly a sweep lays each piece of its path: given the canvas, the piece's middle and its direction.
+type SweepWeight<'a> = dyn Fn(&Painting, [f32; 2], [f32; 2]) -> f32 + 'a;
+
 /// One sweep of the brush along a path: the same bristles all the way, pressure and paint by how far along it is.
 #[allow(clippy::too_many_arguments)]
 fn sweep(
@@ -1342,7 +1625,7 @@ fn sweep(
     pickup: f32,
     load: f32,
     seed: u32,
-    weight: &dyn Fn([f32; 2]) -> f32,
+    weight: &SweepWeight<'_>,
 ) {
     let total: f32 = path.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
     if total < 1.0 {
@@ -1367,7 +1650,7 @@ fn sweep(
         if l < 0.05 {
             continue;
         }
-        let state = weight([(b[0] - a[0]) / l, (b[1] - a[1]) / l]);
+        let state = weight(p, [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], [(b[0] - a[0]) / l, (b[1] - a[1]) / l]);
         if state > 0.04 {
             p.stroke(
                 &Stroke {
@@ -1396,8 +1679,8 @@ fn sweep(
 
 /// Cutting in: where a colour ends, the brush is drawn along the edge, just inside it.
 #[allow(clippy::too_many_arguments)]
-fn paint_contour(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3], width: f32, seed: u32, opacity: f32, body: f32) {
-    for (path, share, ident) in hand_paths(pts, true, width, width * 0.42, seed) {
+fn paint_contour(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3], width: f32, seed: u32, opacity: f32, body: f32, keep: f32, soft: f32) {
+    for (path, share, ident) in hand_paths(pts, true, width, width * 0.42, seed, HAND_OUTLINE) {
         let id = seed ^ ident;
         sweep(
             p,
@@ -1410,20 +1693,32 @@ fn paint_contour(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3
             0.34,
             0.85 * body,
             id,
-            &|_| 1.0,
+            &|p, q, t| found_edge(p, col, q, t, width * 1.5, keep, soft),
         );
     }
 }
 
 /// A drawn line or an outline. `lit`: for a closed outline, how strongly to paint the sides that face the light
-/// (the far sides are always painted).
-fn paint_line(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 3], width: f32, seed: u32, lit: f32) {
-    paint_line_with(p, pts, closed, col, width, seed, lit, 0.55, 0.93)
+/// (the far sides are always painted). `against`: for the outline of a shape, the shape's colour and how much of
+/// the outline to keep where the shape meets its surroundings in the same value (lost and found; see `found_edge`).
+fn paint_line(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 3], width: f32, seed: u32, lit: f32, against: Option<([f32; 3], f32)>) {
+    paint_line_with(p, pts, closed, col, width, seed, lit, 0.55, 0.93, against)
 }
 
 /// `load` 0 = ink (no body), `opacity` below 1 lets what is under it show.
 #[allow(clippy::too_many_arguments)]
-fn paint_line_with(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 3], width: f32, seed: u32, lit: f32, load: f32, opacity: f32) {
+fn paint_line_with(
+    p: &mut Painting,
+    pts: &[[f32; 2]],
+    closed: bool,
+    col: [f32; 3],
+    width: f32,
+    seed: u32,
+    lit: f32,
+    load: f32,
+    opacity: f32,
+    against: Option<([f32; 3], f32)>,
+) {
     let width = width.max(2.5);
     let side = if closed {
         let n = pts.len();
@@ -1431,7 +1726,13 @@ fn paint_line_with(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 
     } else {
         0.0
     };
-    for (path, share, ident) in hand_paths(pts, closed, width, 0.0, seed) {
+    // A fine line is one colour, loaded: a few hairs carrying a second, lighter paint broke a 3 px line into
+    // stripes that read as grey. Broader lines keep their streaks.
+    let fine = smooth(SMALLEST * zoom(), 2.5 * SMALLEST * zoom(), width);
+    let streak = [0, 1, 2].map(|k| shifted(col, 1.15, 0.3)[k] + (shifted(col, 1.4, 0.6)[k] - shifted(col, 1.15, 0.3)[k]) * fine);
+    // an open line is drawn with a rigger, in long pulls, and takes almost nothing from what it crosses
+    let (hand, pickup) = if closed { (HAND_OUTLINE, 0.16 * load / 0.55) } else { (HAND_LINE, 0.05 * load / 0.55) };
+    for (path, share, ident) in hand_paths(pts, closed, width, 0.0, seed, hand) {
         let id = seed ^ ident.rotate_left(7);
         let path = &path;
         // the sweep may have been turned round to be pulled: which side is out depends on its direction
@@ -1444,27 +1745,20 @@ fn paint_line_with(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 
         } else {
             side
         };
-        // lost and found: an edge is stated on the side away from the light and only hinted on the side towards it
-        let weight = |t: [f32; 2]| -> f32 {
+        // lost and found: an edge is stated on the side away from the light and only hinted on the side towards
+        // it, and only where the shape stands out from what it meets
+        let weight = |p: &Painting, q: [f32; 2], t: [f32; 2]| -> f32 {
             if !closed {
                 return 1.0;
             }
             let out = [-t[1] * flip, t[0] * flip];
-            lit + (1.0 - lit) * smooth(0.3, 0.6, (out[0] * 0.64 + out[1] * 0.77) * 0.5 + 0.5)
+            let w = lit + (1.0 - lit) * smooth(0.3, 0.6, (out[0] * 0.64 + out[1] * 0.77) * 0.5 + 0.5);
+            match against {
+                Some((shape, keep)) => w * found_edge(p, shape, q, t, width * 1.5 + 3.0 * zoom(), keep, SOFT.with(|s| s.get())),
+                None => w,
+            }
         };
-        sweep(
-            p,
-            Tool::Round,
-            path,
-            width,
-            shifted(col, 0.95 + 0.2 * hf(id, 4), 0.2),
-            shifted(col, 1.4, 0.6),
-            opacity * share,
-            0.16 * load / 0.55,
-            load,
-            id,
-            &weight,
-        );
+        sweep(p, Tool::Round, path, width, shifted(col, 0.95 + 0.2 * hf(id, 4), 0.2), streak, opacity * share, pickup, load, id, &weight);
     }
 }
 
@@ -1617,6 +1911,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
         let _ = total;
         // the asset declares its depth; the style map does the rest
         BAND.with(|b| b.set(band_of(&it.family)));
+        SOFT.with(|s| s.set(softness(&it.family)));
         // A fade or a flash (fx::flash, world::fade, the whip-pan's cover) is the film's own transition, not a
         // thing in the picture: a sheet of colour over the whole frame at the film's opacity. It is glazed over
         // the painting as it stands, exactly as strong as the film asks, so a fade really fades. (Painted as
@@ -1653,7 +1948,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                     let edge = [ic[0] * 0.55 + leaf[0] * 0.3, ic[1] * 0.55 + leaf[1] * 0.3, ic[2] * 0.55 + leaf[2] * 0.3];
                     let name = h.family.bytes().chain(h.id.bytes()).fold(2166136261u32, |a, b| (a ^ b as u32).wrapping_mul(16777619));
                     ZOOM.with(|z| z.set(hz));
-                    paint_line(&mut p, &hp, true, edge, (w as f32 * hz * 2.2).max(SMALLEST * hz * 0.8), seed.wrapping_mul(7919) ^ name ^ 0x1234, 0.1);
+                    paint_line(&mut p, &hp, true, edge, (w as f32 * hz * 2.2).max(SMALLEST * hz * 0.8), seed.wrapping_mul(7919) ^ name ^ 0x1234, 0.1, None);
                 }
                 for y in 0..sz[1] {
                     for x in 0..sz[0] {
@@ -1754,6 +2049,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                                     let (px, py) = (x as i32 + o[0], y as i32 + o[1]);
                                     if m[y * sz[0] + x] >= 0.5 && px >= 0 && py >= 0 && (px as usize) < WI && (py as usize) < HI {
                                         p.flat[py as usize * WI + px as usize] = quiet(rgb01(c));
+                                        p.wet[py as usize * WI + px as usize] = 1.0;
                                     }
                                 }
                             }
@@ -1775,7 +2071,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
             Kind::Shape { wash, fill, ink, .. } => {
                 let Some((c, op)) = wash.or(fill) else {
                     if let Some((c, w)) = ink {
-                        paint_line(&mut p, &pts, true, rgb01(c), w as f32 * zoom * 1.5, id ^ 0x1234, 0.5);
+                        paint_line(&mut p, &pts, true, rgb01(c), w as f32 * zoom * 1.5, id ^ 0x1234, 0.5, None);
                     }
                     continue;
                 };
@@ -1808,6 +2104,18 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                     continue;
                 }
                 let opacity = if wash.is_some() { 0.97 * smooth(0.0, 0.12, op) } else { (op * 1.1).clamp(0.3, 0.9) };
+                // A shape too thin for an outline down each side (a strap, a twig drawn as a shape) has no room for
+                // two dark lines and its colour between: it is painted as one line of its own colour gone a little
+                // towards the outline's. (Its outline, at least 4 px a side, used to swallow a 5 px shape whole and
+                // run close ones together.)
+                let thick = thickness(&pts);
+                let ink_w = ink.map(|(_, w)| (w as f32 * zoom * 1.5).max(small_brush * 0.6));
+                let room = ink_w.map_or(1.0, |iw| smooth(1.5 * iw, 3.0 * iw, thick));
+                if let (Some((ic, _)), true) = (ink, room < 1.0) {
+                    let ic = rgb01(ic);
+                    let edge = [ic[0] * 0.55 + c[0] * 0.3, ic[1] * 0.55 + c[1] * 0.3, ic[2] * 0.55 + c[2] * 0.3];
+                    c = std::array::from_fn(|k| c[k] + (edge[k] - c[k]) * 0.35 * (1.0 - room));
+                }
                 let _premix = Premix::set(if wash.is_some() { op.min(1.0) } else { 1.0 });
                 let n = pts.len() as f32;
                 let mid = [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n];
@@ -1874,7 +2182,11 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                         //    side and lost towards the light. Subjects keep more of it than backgrounds.
                         let ic = rgb01(ic);
                         let edge = [ic[0] * 0.55 + c[0] * 0.3, ic[1] * 0.55 + c[1] * 0.3, ic[2] * 0.55 + c[2] * 0.3];
-                        paint_line(&mut p, &pts, true, edge, (w as f32 * zoom * 1.5).max(small_brush * 0.6), id ^ 0x1234, if subject { 0.35 } else { 0.1 });
+                        //    Scenery keeps its outline only where it stands out from what it meets.
+                        let _room = Fade::set(room);
+                        let keep = if subject { 0.6 } else { 0.0 };
+                        let _ = w;
+                        paint_line(&mut p, &pts, true, edge, ink_w.unwrap_or(small_brush), id ^ 0x1234, if subject { 0.35 } else { 0.1 }, Some((c, keep)));
                     }
                 }
                 if small_k > 0.001 && accent_k > 0.001 {
@@ -1910,7 +2222,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                         let _round = Fade::set(1.0 - knife_k);
                         paint_body(&mut p, &pts, c, c, 0.98, id, 0.8, 1.2, Tool::Round);
                         if let Some((ic, w)) = ink {
-                            paint_line(&mut p, &pts, true, rgb01(ic), (w as f32 * zoom * 1.3).max(small_brush * 0.45), id ^ 0x1234, 0.85);
+                            paint_line(&mut p, &pts, true, rgb01(ic), (w as f32 * zoom * 1.3).max(small_brush * 0.45), id ^ 0x1234, 0.85, None);
                         }
                     }
                 }
@@ -1959,7 +2271,8 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
                     continue;
                 }
                 let _flick = Fade::set(flick);
-                paint_line(&mut p, &pts, false, rgb01(col), w.max(small_brush * 0.55), id ^ 0x4321, 1.0);
+                // (a rigger draws finer than the smallest brush paints an area)
+                paint_line(&mut p, &pts, false, rgb01(col), w.max(small_brush * 0.42), id ^ 0x4321, 1.0, None);
             }
             Kind::Glow { .. } => {}
         }
@@ -2195,6 +2508,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         let wash = box_blur(&subject, 48);
         p.col.copy_from_slice(&wash);
         p.flat.copy_from_slice(&wash);
+        p.wet.fill(1.0);
     }
     // ---- block the whole canvas in with the big flat, squinting
     {
@@ -2216,7 +2530,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
             let d = [a.cos(), a.sin()];
             let path: Vec<[f32; 2]> = (0..7).map(|i| [q[0] + d[0] * w * 0.45 * (i as f32 - 3.0), q[1] + d[1] * w * 0.45 * (i as f32 - 3.0)]).collect();
             let c = seen[px(q)];
-            sweep(&mut p, Tool::Flat, &path, w * (0.85 + 0.3 * hf(id, 4)), c, shifted(c, 1.06, 0.4), 0.97, 0.2, 0.5, id, &|_| 1.0);
+            sweep(&mut p, Tool::Flat, &path, w * (0.85 + 0.3 * hf(id, 4)), c, shifted(c, 1.06, 0.4), 0.97, 0.2, 0.5, id, &|_, _, _| 1.0);
         }
     }
     // ---- structure first. A cellular automaton finds the picture's regions: seeds are scattered (thickly where
@@ -2531,7 +2845,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
                 }
             }
             let width = w * (0.8 + 0.35 * hf(id, 4));
-            sweep(&mut p, tool, &path, width, c, shifted(c, 1.1, 0.5), 0.96, 0.12 + 0.14 * hf(id, 5), load, id, &|_| 1.0);
+            sweep(&mut p, tool, &path, width, c, shifted(c, 1.1, 0.5), 0.96, 0.12 + 0.14 * hf(id, 5), load, id, &|_, _, _| 1.0);
         }
         eprintln!("brush {w:>4.0}: {} strokes so far, {:.1} s", p.strokes, t0.elapsed().as_secs_f64());
     }
@@ -2577,7 +2891,7 @@ pub fn run_mix(args: &[String]) -> Result<(), String> {
                 let y = y0 + 60.0 + j as f32 * 88.0;
                 let path: Vec<[f32; 2]> =
                     (0..40).map(|i| [x0 + 26.0 + i as f32 * (w - 52.0) / 39.0, y + 14.0 * ((i as f32) * 0.22 + j as f32).sin()]).collect();
-                sweep(&mut p, Tool::Filbert, &path, 46.0, *drag, *drag, 0.97, 0.25 + 0.2 * j as f32, 1.0, 900 + (k * 10 + j) as u32, &|_| 1.0);
+                sweep(&mut p, Tool::Filbert, &path, 46.0, *drag, *drag, 0.97, 0.25 + 0.2 * j as f32, 1.0, 900 + (k * 10 + j) as u32, &|_, _, _| 1.0);
             }
         }
     }
@@ -3253,7 +3567,7 @@ mod tests {
             let lo = [-80.0f32, 194.0 + dy];
             let hi = [WI as f32 + 80.0, HI as f32 + 80.0];
             let now: std::collections::HashMap<u32, (f32, [f32; 2])> =
-                plan_slots(&pts, c, lo, hi, width, base, 0x8504_0000).into_iter().map(|(q, id, e)| (id, (e, q))).collect();
+                plan_slots(&pts, c, lo, hi, width, base, 0x8504_0000, 1.0).into_iter().map(|(q, id, e)| (id, (e, q))).collect();
             if k > 0 {
                 for (id, (e, q)) in &now {
                     let d = match prev.get(id) {
@@ -3393,7 +3707,8 @@ mod tests {
         let mut worst = (0.0f32, 0usize);
         for k in 0..600 {
             let sy = 1.0 + k as f32 * 0.0005;
-            let now: std::collections::HashMap<u32, f32> = hand_paths(&shape(sy), true, 9.0, 0.0, 0xC0FFEE).into_iter().map(|(_, w, id)| (id, w)).collect();
+            let now: std::collections::HashMap<u32, f32> =
+                hand_paths(&shape(sy), true, 9.0, 0.0, 0xC0FFEE, HAND_OUTLINE).into_iter().map(|(_, w, id)| (id, w)).collect();
             if k > 0 {
                 for (id, w) in &now {
                     let d = (w - prev.get(id).copied().unwrap_or(0.0)).abs();
@@ -3467,6 +3782,104 @@ mod tests {
             3.0 + 37.0 * worst.1 as f32 / n as f32,
             worst.0
         );
+    }
+
+    /// A one-shot film: a dusk sky and one long strap (outlined, as films draw them) whose breadth grows with t,
+    /// from a line 3 px across to an area 60 px across.
+    fn strap(r: &mut Rec, t: f64, _lt: f64) {
+        r.boil("sky");
+        r.paint("sky", &rect_pts(-100.0, -100.0, 2120.0, 1280.0), wash(rgb(0x2C3A6A)).no_ink());
+        r.boil("strap");
+        let w = 3.0 + 57.0 * t;
+        let (a, b) = ([700.0, 300.0], [1250.0, 800.0]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l = f64::hypot(dx, dy);
+        let n = [-dy / l * w / 2.0, dx / l * w / 2.0];
+        r.paint(
+            "strap",
+            &[[a[0] + n[0], a[1] + n[1]], [b[0] + n[0], b[1] + n[1]], [b[0] - n[0], b[1] - n[1]], [a[0] - n[0], a[1] - n[1]]],
+            wash(rgb(0xC9A27A)),
+        );
+    }
+
+    #[test]
+    fn a_strap_widening_from_a_line_to_an_area_never_pops() {
+        // A thin shape is painted as one pull of a fine brush with no room for an outline down each side; a broad
+        // one as an area with its outline and its cut-in edge. Widen a slanted strap through all of that in small
+        // steps: the painting may change only as much as the widening does, never in one jump.
+        let film = Film::new("strap", 1.0, vec![Shot::new(0.0, "strap", strap)], "/nonexistent/strap/film");
+        set_style(Style::DEFAULT);
+        if test_gpu() {
+            set_backend(Backend::Gpu);
+        }
+        let n = 90;
+        let frames: Vec<Vec<[f32; 3]>> = (0..=n).map(|i| paint_frame_painting(&film, i as f64 / n as f64, 1).col).collect();
+        let steps: Vec<f32> = frames
+            .windows(2)
+            .map(|w| {
+                let mut sum = 0.0f32;
+                for y in (300..800).step_by(2) {
+                    for x in (650..1300).step_by(2) {
+                        let (a, b) = (w[0][y * WI + x], w[1][y * WI + x]);
+                        sum += (0..3).map(|k| (a[k] - b[k]).abs()).sum::<f32>() / 3.0;
+                    }
+                }
+                sum / (250.0 * 325.0)
+            })
+            .collect();
+        let mut worst = (0.0f32, 0usize);
+        for i in 3..steps.len() - 3 {
+            let around = (steps[i - 3] + steps[i - 2] + steps[i - 1] + steps[i + 1] + steps[i + 2] + steps[i + 3]) / 6.0;
+            let r = steps[i] / (around + 0.0005);
+            if r > worst.0 {
+                worst = (r, i);
+            }
+        }
+        assert!(
+            worst.0 < 2.5,
+            "breadth {:.1} px: one step changed the strap {:.1}x as much as the steps around it",
+            3.0 + 57.0 * worst.1 as f32 / n as f32,
+            worst.0
+        );
+    }
+
+    fn strips(r: &mut Rec, _t: f64, _lt: f64) {
+        r.boil("sky");
+        r.paint("sky", &rect_pts(-100.0, -100.0, 2120.0, 1280.0), wash(rgb(0x2C3A6A)).no_ink());
+        r.boil("strips");
+        for i in 0..6 {
+            let x = 700.0 + i as f64 * 14.0;
+            r.paint("strip", &[[x, 300.0], [x + 6.0, 300.0], [x + 306.0, 800.0], [x + 300.0, 800.0]], wash(rgb(0xC9A27A)));
+        }
+    }
+
+    #[test]
+    fn close_thin_strips_stay_apart() {
+        // Twigs, straps and whiskers drawn as thin shapes a few px apart ran together into one smear: each got a
+        // brush as wide as its slanted bounding box, spilling far past its sides, and an outline down each side as
+        // wide as itself. The gap between two such strips must stay the colour of what is behind them.
+        let film = Film::new("strips", 1.0, vec![Shot::new(0.0, "strips", strips)], "/nonexistent/strips/film");
+        set_style(Style::DEFAULT);
+        if test_gpu() {
+            set_backend(Backend::Gpu);
+        }
+        let p = paint_frame_painting(&film, 0.0, 1);
+        let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+        let sky = lum(rgb01(rgb(0x2C3A6A)));
+        let (mut gap, mut core, mut n) = (0.0f32, 0.0f32, 0.0f32);
+        for y in (400..700).step_by(5) {
+            let t = (y as f32 - 300.0) / 500.0;
+            for i in 0..5 {
+                // the middle of a strip, and the middle of the gap after it
+                let x = 700.0 + i as f32 * 14.0 + 300.0 * t;
+                core += lum(p.col[y * WI + (x + 3.0) as usize]);
+                gap += lum(p.col[y * WI + (x + 10.0) as usize]);
+                n += 1.0;
+            }
+        }
+        let (gap, core) = (gap / n, core / n);
+        assert!(core - sky > 0.15, "the strips themselves should be painted ({core:.3} against the sky's {sky:.3})");
+        assert!((gap - sky).abs() < 0.35 * (core - sky), "the gaps filled in: {gap:.3}, sky {sky:.3}, strips {core:.3}");
     }
 
     #[test]
@@ -3546,7 +3959,7 @@ mod tests {
         };
         let night = [0.05, 0.07, 0.2];
         let frame = |k: f32| {
-            let mut p = Painting { col: base.col.clone(), flat: base.flat.clone(), thick: base.thick.clone(), strokes: 0, rec: None, view: 1.0 };
+            let mut p = Painting::with_layers(base.col.clone(), base.flat.clone(), base.thick.clone());
             glaze(&mut p, night, k);
             done(p)
         };
@@ -3605,7 +4018,7 @@ mod tests {
         // as the film's opacity runs out the wash disappears smoothly
         // (just above the 0.004 below which a wash is left out: its last frame must be next to nothing)
         let (before, faint) = paint(0.005);
-        let base = Painting { col: before, flat: faint.flat.clone(), thick: faint.thick.clone(), strokes: 0, rec: None, view: 1.0 };
+        let base = Painting::with_layers(before, faint.flat.clone(), faint.thick.clone());
         let pk = block_peak(&faint, &base, 360, 720);
         assert!(pk < 0.01, "a 1 % wash moved a block by {:.2} %", pk * 100.0);
         assert_eq!(PREMIX.with(|p| p.get()), 1.0, "the tint must not leak into the next shape");
