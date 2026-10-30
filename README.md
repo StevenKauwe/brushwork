@@ -69,7 +69,12 @@ say what a shape **is** (`brushwork_paint::Role`, with `Po::role`) and the light
 | `Light` | a light source (moon, lamp, window): clean luminous paint, softly modelled, fully covered, no cut-in edge |
 | `Highlight`, `Accent`, `Line` | a clean loaded touch; a crisp small detail; one pull of a rigger |
 
-Glows (`Rec::glows`) are scumbled round their light. Forms in the cast turn from the declared key light over a soft
+Light falls on what is already painted. A `Light` lights the air and the paint round it (as far as the scene's
+`Lighting::haze` carries it, and a brighter aureole close in), and so do the film's glows (`Rec::glows`): the strokes
+there are lifted towards the light's colour, mixed with theirs as pigment, more on the ridges of their paint that
+catch it and less in the hollows between. The light has no texture of its own: as it moves (a moon rising, a lamp
+carried past a wall) the brushwork stays where it is and each stroke only grows lighter or darker
+(`a_light_gliding_over_a_still_sky_moves_no_texture`). Forms in the cast turn from the declared key light over a soft
 terminator into a core shadow, with reflected light at the far rim, in their own colour mixed down with the palette's
 darks (`Style::palette`), never grey or black. `Lighting::MOONLIGHT`, `FIRELIGHT`, `DAYLIGHT`, `OVERCAST` and `SUNSET`
 are ready-made; `.at(point)` places the key light in the picture (shadows fall away from it), `.from_dir(dir)` aims it.
@@ -110,7 +115,8 @@ from a flicker that was once seen in a film:
 - `level_strokes_end_raggedly_not_on_a_vertical_seam`, `same_shape_same_place_paints_identically`
 - `a_fade_fades_and_leaves_without_a_pop`, `a_translucent_wash_is_mixed_down_not_glazed_in_streaks`
 - `a_strap_widening_from_a_line_to_an_area_never_pops`, `close_thin_strips_stay_apart`
-- `a_shadow_is_a_glaze_that_keeps_what_it_falls_on`, `a_shadow_fading_in_and_a_glow_growing_never_pop`, ...
+- `a_shadow_is_a_glaze_that_keeps_what_it_falls_on`, `a_shadow_fading_in_and_a_glow_growing_never_pop`
+- `a_light_gliding_over_a_still_sky_moves_no_texture`, ...
 
 `cargo test --release` runs them on the CPU; `OIL_TEST_BACKEND=gpu cargo test --release --features brushwork/gpu`
 runs them on the GPU. For a rendered film, `flickscan <dir> <first> <last>` lists any block that changes for a frame

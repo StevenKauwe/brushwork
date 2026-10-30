@@ -600,22 +600,22 @@ impl Painting {
         self.area(mask, o, sz, glaze.0, anchor, dir, id, Layer::Shade(glaze.1, glaze.2))
     }
 
-    /// A scumble over an area: light paint `col` dragged thinly over what is there (`mask` how much of it), broken by
-    /// the canvas's tooth (a coarse, dry grain), the way a painter lays a glow round a light or a veil of haze.
-    fn scumble_area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], col: [f32; 3], anchor: [f32; 2], dir: [f32; 2], id: u32) {
-        self.area(mask, o, sz, col, anchor, dir, id, Layer::Scumble)
+    /// Light falling on what is painted: `mask` is how much of the light reaches each pixel (0 to 1); the paint
+    /// there is lifted towards `inner` (near the light) or `outer` (at its reach), by `a` at most. See `light_on`.
+    fn light_area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], inner: [f32; 3], outer: [f32; 3], a: f32) {
+        self.area(mask, o, sz, inner, [0.0; 2], [0.0, 1.0], 0, Layer::Light(outer, a))
     }
 
     fn area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], id: u32, layer: Layer) {
         let z = zoom();
         if let Some(r) = self.rec.as_mut() {
             r.use_mask(mask, o, sz);
-            let (mode, mix, step) = match layer {
-                Layer::Glaze => (0, 0.0, 0.0),
-                Layer::Scumble => (1, 0.0, 0.0),
-                Layer::Shade(mix, step) => (2, mix, step),
+            let (mode, mix, step, alt, a) = match layer {
+                Layer::Glaze => (0, 0.0, 0.0, [0.0; 3], 0.0),
+                Layer::Light(outer, a) => (1, 0.0, 0.0, outer, a),
+                Layer::Shade(mix, step) => (2, mix, step, [0.0; 3], 0.0),
             };
-            r.glaze_area(tint, anchor, dir, z, id, mode, mix, step);
+            r.glaze_area(tint, anchor, dir, z, id, mode, mix, step, alt, a);
             return;
         }
         for my in 0..sz[1] {
@@ -631,14 +631,10 @@ impl Painting {
                 }
                 let (gx, gy) = (x as f32 + 0.5 - anchor[0], y as f32 + 0.5 - anchor[1]);
                 let (gu, gv) = (gx * dir[1] + gy * dir[0], -gx * dir[0] + gy * dir[1]);
+                let th = self.thick[y as usize * WI + x as usize];
                 let c = &mut self.col[y as usize * WI + x as usize];
                 match layer {
-                    Layer::Scumble => {
-                        let g = m * (0.72 + 0.28 * noise(gu / (60.0 * z), gv / (16.0 * z), id));
-                        for k in 0..3 {
-                            c[k] += (tint[k] - c[k]) * g;
-                        }
-                    }
+                    Layer::Light(outer, a) => *c = light_on(*c, th, m, tint, outer, a),
                     Layer::Glaze => {
                         let g = m * glaze_grain(gu, gv, z, id);
                         for k in 0..3 {
@@ -646,7 +642,9 @@ impl Painting {
                         }
                     }
                     Layer::Shade(mix, step) => {
-                        let g = m * glaze_grain(gu, gv, z, id);
+                        // (its grain is the paint it falls on: a shadow moving with its caster slides over the
+                        // ground's own brushwork and carries no texture of its own along)
+                        let g = m * (0.82 + 0.25 * relief(th));
                         let sh = shade_paint(*c, tint, mix, step);
                         for k in 0..3 {
                             c[k] += (sh[k] - c[k]) * g;
@@ -778,8 +776,9 @@ impl Drop for Fade {
 enum Layer {
     /// a transparent colour: the paint multiplied by it
     Glaze,
-    /// light paint dragged thinly over it
-    Scumble,
+    /// light falling on it: the paint lifted towards the light's colour near it (`tint`) and towards this outer
+    /// colour at its reach, by this much at most (`light_on`)
+    Light([f32; 3], f32),
     /// a shadow: the paint taken down by its own shadow colour (`shade_paint` with this mix and step)
     Shade(f32, f32),
 }
@@ -890,12 +889,15 @@ struct Light {
     at: Option<[f32; 2]>,
     key: [f32; 3],
     strength: f32,
+    /// How hazy the air is (how far a light's glow reaches into it).
+    haze: f32,
     /// The paint shadows are mixed down with: the palette's colour nearest the ambient light's, among its darks
     /// (or a deep mix of the ambient light's colour).
     pigment: [f32; 3],
 }
 /// A plain light from the upper left (what every frame had before lighting could be declared).
-const PLAIN_LIGHT: Lighting = Lighting { key_dir: [-0.64, -0.77], key_at: None, key: [255.0, 246.0, 232.0], strength: 0.6, ambient: [96.0, 104.0, 140.0] };
+const PLAIN_LIGHT: Lighting =
+    Lighting { key_dir: [-0.64, -0.77], key_at: None, key: [255.0, 246.0, 232.0], strength: 0.6, ambient: [96.0, 104.0, 140.0], haze: 0.3 };
 
 fn lum3(c: [f32; 3]) -> f32 {
     0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
@@ -917,7 +919,14 @@ impl Light {
             ambient[1] * 0.55,
             ambient[2] * 0.55,
         ]);
-        Light { dir: [l.key_dir[0] as f32 / n, l.key_dir[1] as f32 / n], at, key: c(l.key), strength: l.strength.clamp(0.0, 1.0) as f32, pigment }
+        Light {
+            dir: [l.key_dir[0] as f32 / n, l.key_dir[1] as f32 / n],
+            at,
+            key: c(l.key),
+            strength: l.strength.clamp(0.0, 1.0) as f32,
+            haze: l.haze.clamp(0.0, 1.0) as f32,
+            pigment,
+        }
     }
     /// Towards the key light from `q`.
     fn towards(&self, q: [f32; 2]) -> [f32; 2] {
@@ -957,6 +966,30 @@ impl Light {
         let depth = depth.clamp(0.0, 1.0);
         (self.pigment, 0.16 * depth, depth * self.strength * 0.72)
     }
+}
+
+/// How much paint stands up at a point, 0 to about 0.8: the brushwork's own relief (its ridges, the lips at its
+/// strokes' sides), which stays where the strokes are.
+fn relief(th: f32) -> f32 {
+    let th = th.max(0.0);
+    th / (th + 0.12)
+}
+
+/// Light falling on paint `c` (thickness `th`) from a light whose reach is `f` here (0 at its edge, 1 at its
+/// heart): the paint lifted towards the light, as a painter paints a moon's light on the sky. Not a gradient laid
+/// over the picture: the strokes already there take the light, the ridges of their paint more and the hollows
+/// between them less, so its texture is theirs, and it does not move. As the light moves, each stroke only grows
+/// lighter or darker. (Value steps round the light, tried first, were themselves rings travelling with it.) The
+/// paint goes towards `inner` near the light and `outer` at its reach, by `a` at most. (strokes.wgsl has the same.)
+fn light_on(c: [f32; 3], th: f32, f: f32, inner: [f32; 3], outer: [f32; 3], a: f32) -> [f32; 3] {
+    let tex = relief(th);
+    // (the ridges catch it and the hollows between strokes stay darker; strokes nearer the light take a lighter
+    // value, broken by their own relief)
+    let g = (a * f * (0.45 + 1.1 * tex)).clamp(0.0, 1.0);
+    std::array::from_fn(|i| {
+        let target = outer[i] + (inner[i] - outer[i]) * f;
+        c[i] + (target - c[i]) * g
+    })
 }
 
 /// A shadow glazed over paint `c`: a touch (`mix`) of the shadow colour `pig` worked in, and its value taken down by
@@ -2118,10 +2151,10 @@ fn caster_of(items: &[Item], shadow: &Item, cam: Option<Cam>) -> Option<Vec<[f32
 /// dark shows through broken at the rim. (The film draws its glows as additive light; the painter ignored them,
 /// so a moon had no light round it at all.) Rings and strokes are fixed in number and scale with the glow, so a
 /// glow that grows or shrinks keeps its strokes; each stroke is its paint let down with what it lands on.
-fn paint_glow(p: &mut Painting, centre: [f32; 2], radius: f32, col: [f32; 3], a: f32, id: u32) {
+fn paint_glow(p: &mut Painting, centre: [f32; 2], radius: f32, col: [f32; 3], a: f32) {
     let z = zoom();
-    let fade = FADE.with(|f| f.get()) * smooth(6.0 * z, 14.0 * z, radius);
-    if fade <= 0.002 || a <= 0.002 {
+    let a = (a * FADE.with(|f| f.get()) * smooth(6.0 * z, 14.0 * z, radius)).min(0.85);
+    if a <= 0.002 {
         return;
     }
     let r = radius.max(1.0);
@@ -2137,12 +2170,16 @@ fn paint_glow(p: &mut Painting, centre: [f32; 2], radius: f32, col: [f32; 3], a:
         for x in 0..sz[0] {
             let t = ((x as i32 + o[0]) as f32 + 0.5 - centre[0]).hypot((y as i32 + o[1]) as f32 + 0.5 - centre[1]) / r;
             if t < 1.0 {
-                // the light falls off quickly away from its source
-                m[y * sz[0] + x] = (a * (1.0 - t).powf(1.8) * 1.15).min(0.92) * fade;
+                // light scattered by the air falls off quickly away from its source
+                m[y * sz[0] + x] = (1.0 - t).powf(1.8);
             }
         }
     }
-    p.scumble_area(&m, o, sz, col, centre, [0.0, 1.0], h32(id ^ 0x6170));
+    // near the light the paint goes to its own colour; further out to the light's colour mixed (as pigment) with
+    // the paint the light falls on there, as a painter mixes the halo from the sky's colour and the moon's
+    let sky = flat_under(&p.flat, centre[0], centre[1], r * 0.3, col);
+    let outer = pigment_mix(col, sky, 0.5);
+    p.light_area(&m, o, sz, col, outer, a);
 }
 
 /// A drawn line or an outline. `lit`: for a closed outline, how strongly to paint the sides that face the light
@@ -2654,6 +2691,18 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     _ => 0.0,
                 };
                 let clean = if it.role == Role::Highlight { 1.0 } else { light_k };
+                // a light lights the air and the paint round it: a glow as far as the haze carries it, and a
+                // brighter aureole close in (painted onto what is already there, before the light itself)
+                if light_k > 0.001 {
+                    let rad = pts.iter().map(|q| (q[0] - centre[0]).hypot(q[1] - centre[1])).fold(0.0f32, f32::max);
+                    let haze = frame_light().haze;
+                    // (a light smaller than a brush mark, a star, gets no halo of its own: the film's glows say which
+                    // of them shine; it arrives by degrees with the light's size)
+                    let _k = Fade::set(light_k * smooth(0.0, 0.12, op) * smooth(SMALLEST * zoom, 3.0 * SMALLEST * zoom, rad));
+                    // (it reaches as far again in the air as the light is big, and some way onto what is near it)
+                    paint_glow(&mut p, centre, rad * (1.6 + 5.0 * haze) + 180.0 * haze * zoom, c, 0.35 + 0.45 * haze);
+                    paint_glow(&mut p, centre, rad * 1.35, c, 0.35);
+                }
                 let _mode = ModeGuard::set(Mode { clean, model: light_k, line: if it.role == Role::Line { 1.0 } else { 0.0 } });
                 // the role says how far back it sits, where the film's bands do not
                 match it.role {
@@ -2823,7 +2872,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
             }
             Kind::Glow { col, a } => {
                 let r = (pts[1][0] - pts[0][0]).hypot(pts[1][1] - pts[0][1]);
-                paint_glow(&mut p, pts[0], r, rgb01(col), a as f32, id ^ 0x6100);
+                paint_glow(&mut p, pts[0], r, rgb01(col), a as f32);
             }
         }
     }
@@ -4563,6 +4612,78 @@ mod tests {
                 assert!(steps[i] < 2.5 * around + 0.002, "the {what}: step {i} changed it {:.1}x as much as the steps around it", steps[i] / around.max(1e-6));
             }
         }
+    }
+
+    /// A one-shot film: a still night sky in bands, and a light gliding across it from left to right as `t` runs
+    /// from 0.1 to 1 (no light before 0.1).
+    fn gliding(r: &mut Rec, t: f64, _lt: f64) {
+        for i in 0..5 {
+            let c = [0x14 as f64 + i as f64 * 7.0, 0x20 as f64 + i as f64 * 8.0, 0x4A as f64 + i as f64 * 10.0];
+            r.boil(format!("sky{i}"));
+            r.paint("band", &rect_pts(-60.0, -60.0 + i as f64 * 240.0, 2040.0, 300.0), wash(c).no_ink());
+        }
+        if t >= 0.1 {
+            r.glows("lamp.glow", &[(500.0 + 600.0 * t, 450.0, 520.0, rgb(0xFFE0A8), 0.55)]);
+        }
+    }
+
+    #[test]
+    fn a_light_gliding_over_a_still_sky_moves_no_texture() {
+        // The owner's moonrise: the moon's glow was a texture of its own, anchored on the moon, so as the moon rose
+        // the same pattern slid up over the sky ("a filter sliding"). Light falls on what is there: as it moves,
+        // the strokes it falls on only grow lighter or darker, and no texture goes with it. Measured on the light's
+        // own mark (the painting with the light over the painting without it), band-passed to keep its texture:
+        // two positions of the light must agree with each other where they are, not where the light has moved to.
+        let film = Film::new("gliding", 1.0, vec![Shot::new(0.0, "g", gliding)], "/nonexistent/gliding/film");
+        set_style(Style::DEFAULT);
+        if test_gpu() {
+            set_backend(Backend::Gpu);
+        }
+        let base = paint_frame_painting(&film, 0.0, 1).col;
+        let (ta, tb) = (0.45f64, 0.65f64);
+        let shift = (600.0 * (tb - ta)).round() as usize;
+        let mark = |t: f64| -> Vec<f32> {
+            let c = paint_frame_painting(&film, t, 1).col;
+            c.iter().zip(&base).map(|(a, b)| ((lum3(*a) + 0.01) / (lum3(*b) + 0.01)).ln()).collect()
+        };
+        let (ma, mb) = (mark(ta), mark(tb));
+        // the band-pass: a small box mean less a large one, over the region both lights reach
+        let (x0, x1, y0, y1) = (760usize, 1000usize, 300usize, 600usize);
+        let boxm = |m: &[f32], x: usize, y: usize, r: usize| -> f32 {
+            let mut s = 0.0;
+            for yy in y - r..=y + r {
+                for xx in x - r..=x + r {
+                    s += m[yy * WI + xx];
+                }
+            }
+            s / ((2 * r + 1) * (2 * r + 1)) as f32
+        };
+        let bp = |m: &[f32], dx: usize| -> Vec<f32> {
+            let mut v = vec![];
+            for y in (y0..y1).step_by(6) {
+                for x in (x0 + dx..x1 + dx).step_by(6) {
+                    v.push(boxm(m, x, y, 4) - boxm(m, x, y, 30));
+                }
+            }
+            v
+        };
+        let corr = |a: &[f32], b: &[f32]| -> f32 {
+            let n = a.len() as f32;
+            let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
+            let (mut sab, mut saa, mut sbb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                sab += (x - ma) * (y - mb);
+                saa += (x - ma).powi(2);
+                sbb += (y - mb).powi(2);
+            }
+            sab / (saa * sbb).sqrt().max(1e-12)
+        };
+        let a_here = bp(&ma, 0);
+        let (still, moved) = (corr(&a_here, &bp(&mb, 0)), corr(&a_here, &bp(&mb, shift)));
+        if std::env::var("GLIDE").is_ok() {
+            eprintln!("texture of the light's mark: in place {still:.3}, travelled with the light {moved:.3}");
+        }
+        assert!(still > 0.6 && still > moved + 0.3, "the light's texture travels with it: in place {still:.3}, moved {moved:.3}");
     }
 
     #[test]

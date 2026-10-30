@@ -22,11 +22,13 @@ use brushwork_kit::Col;
 /// | `FormShadow` | the side of a body turned from the light | the same derivation, glazed into the body, its edges lost |
 /// | `Highlight` | where the light catches | a loaded touch of light paint (a knife on a small one) |
 /// | `Glaze` | a transparent tint over what is below | a thin coloured layer: what is below shows through |
-/// | `Light` | a light source (moon, lamp, sun, window) | clean luminous paint, softly modelled, a crisp but not cut-out edge |
+/// | `Light` | a light source (moon, lamp, sun, window) | clean luminous paint, softly modelled, a crisp but not cut-out edge; it lights what is round it (see below) |
 /// | `Accent` | a small detail that must read | crisp, small brush, clean paint |
 /// | `Line` | linework drawn as a shape | one pull of a rigger |
 ///
-/// Glows (`Rec::glows`) are painted as a scumbled halo of light round their centre.
+/// Light falls on what is already painted: a light (and a glow, `Rec::glows`) lifts the paint round it towards its
+/// colour, in a few soft value steps broken by that paint's own brushwork, so nothing travels with the light but
+/// the light itself. How far a light's own glow reaches goes with the air's [`Lighting::haze`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Role {
     #[default]
@@ -60,20 +62,26 @@ pub struct Lighting {
     pub strength: f64,
     /// The ambient light filling the shadows (the sky's colour): shadows are turned towards it.
     pub ambient: Col,
+    /// How hazy the air is, 0 to 1: how far a light's glow spreads into it (a clear night 0.3, mist 0.8).
+    pub haze: f64,
 }
 
 impl Lighting {
     /// A clear night under a full moon: a cool silver key, a deep blue sky filling the shadows.
-    pub const MOONLIGHT: Lighting = Lighting { key_dir: [-0.6, -0.8], key_at: None, key: [214.0, 226.0, 255.0], strength: 0.72, ambient: [40.0, 58.0, 120.0] };
+    pub const MOONLIGHT: Lighting =
+        Lighting { key_dir: [-0.6, -0.8], key_at: None, key: [214.0, 226.0, 255.0], strength: 0.72, ambient: [40.0, 58.0, 120.0], haze: 0.35 };
     /// Firelight or a lamp: a warm orange key, cool dark shadows.
-    pub const FIRELIGHT: Lighting = Lighting { key_dir: [-0.6, -0.8], key_at: None, key: [255.0, 176.0, 98.0], strength: 0.8, ambient: [52.0, 50.0, 92.0] };
+    pub const FIRELIGHT: Lighting =
+        Lighting { key_dir: [-0.6, -0.8], key_at: None, key: [255.0, 176.0, 98.0], strength: 0.8, ambient: [52.0, 50.0, 92.0], haze: 0.5 };
     /// Sunlight on a clear day: a warm white key, blue sky in the shadows.
     pub const DAYLIGHT: Lighting =
-        Lighting { key_dir: [-0.64, -0.77], key_at: None, key: [255.0, 244.0, 222.0], strength: 0.7, ambient: [120.0, 150.0, 210.0] };
+        Lighting { key_dir: [-0.64, -0.77], key_at: None, key: [255.0, 244.0, 222.0], strength: 0.7, ambient: [120.0, 150.0, 210.0], haze: 0.15 };
     /// An overcast sky: soft, cool, little difference between light and shade.
-    pub const OVERCAST: Lighting = Lighting { key_dir: [-0.3, -0.95], key_at: None, key: [232.0, 236.0, 240.0], strength: 0.4, ambient: [150.0, 160.0, 175.0] };
+    pub const OVERCAST: Lighting =
+        Lighting { key_dir: [-0.3, -0.95], key_at: None, key: [232.0, 236.0, 240.0], strength: 0.4, ambient: [150.0, 160.0, 175.0], haze: 0.7 };
     /// Sunset: a low orange key, violet shadows.
-    pub const SUNSET: Lighting = Lighting { key_dir: [0.95, -0.3], key_at: None, key: [255.0, 160.0, 96.0], strength: 0.75, ambient: [92.0, 70.0, 140.0] };
+    pub const SUNSET: Lighting =
+        Lighting { key_dir: [0.95, -0.3], key_at: None, key: [255.0, 160.0, 96.0], strength: 0.75, ambient: [92.0, 70.0, 140.0], haze: 0.45 };
 
     /// The same light coming from `dir` (towards the light, on the canvas).
     pub const fn from_dir(mut self, dir: [f64; 2]) -> Lighting {

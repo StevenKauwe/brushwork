@@ -128,12 +128,8 @@ fn shot(r: &mut Rec, _t: f64, _lt: f64) {
             match shape.kind {
                 Kind::Plain => r.paint("shape", &shape.pts, po),
                 Kind::Shadow => r.paint("shadow", &shape.pts, po.no_ink().role(Role::Shadow)),
-                Kind::Glow => {
-                    let c = centre(&shape.pts);
-                    let rad = shape.pts.iter().map(|q| (q[0] - c[0]).hypot(q[1] - c[1])).fold(0.0, f64::max);
-                    r.glows("glow", &[(c[0], c[1], rad * 3.2, shape.col, 0.5), (c[0], c[1], rad * 1.6, shape.col, 0.45)]);
-                    r.paint("light", &shape.pts, po.no_ink().role(Role::Light));
-                }
+                // (a light lights what is round it by itself)
+                Kind::Glow => r.paint("light", &shape.pts, po.no_ink().role(Role::Light)),
             }
         }
     });
