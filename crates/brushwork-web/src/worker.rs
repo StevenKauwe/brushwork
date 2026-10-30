@@ -57,9 +57,9 @@ fn crop(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// Paint `shapes` (canvas pixels in a `w` x `h` region at the top left of brushwork's canvas) on the CPU: RGBA for
 /// the region.
-pub fn paint(shapes: Vec<scene::Shape>, seed: u32, w: usize, h: usize) -> Vec<u8> {
+pub fn paint(shapes: Vec<scene::Shape>, light: scene::Light, seed: u32, w: usize, h: usize) -> Vec<u8> {
     brushwork::set_style(scene::STYLE);
-    crop(&brushwork::paint_frame(&scene::film(shapes), 0.0, seed), w, h)
+    crop(&brushwork::paint_frame(&scene::film(shapes, light), 0.0, seed), w, h)
 }
 
 /// One paint request from the page.
@@ -70,6 +70,7 @@ struct Request {
     h: usize,
     /// the page asked for the CPU
     cpu: bool,
+    light: scene::Light,
 }
 
 impl Request {
@@ -81,6 +82,7 @@ impl Request {
             w: msg.get(2).as_f64().unwrap_or(1024.0) as usize,
             h: msg.get(3).as_f64().unwrap_or(576.0) as usize,
             cpu: msg.get(4).as_string().is_some_and(|b| b == "cpu"),
+            light: scene::Light { preset: msg.get(5).as_f64().unwrap_or(0.0) as usize, from: msg.get(6).as_f64().unwrap_or(0.0) as usize },
         }
     }
 }
@@ -139,7 +141,7 @@ async fn paint_request(r: Request) -> (Vec<u8>, &'static str) {
     if GPU.with(Cell::get) == Gpu::Ready && !r.cpu {
         brushwork::set_style(scene::STYLE);
         brushwork::set_backend(brushwork::Backend::Gpu);
-        match brushwork::paint_frame_async(&scene::film(r.shapes.clone()), 0.0, r.seed).await {
+        match brushwork::paint_frame_async(&scene::film(r.shapes.clone(), r.light), 0.0, r.seed).await {
             Ok(rgb) => return (crop(&rgb, r.w, r.h), "gpu"),
             Err(why) => {
                 let fails = FAILS.with(|f| f.replace(f.get() + 1)) + 1;
@@ -150,7 +152,7 @@ async fn paint_request(r: Request) -> (Vec<u8>, &'static str) {
         }
     }
     brushwork::set_backend(brushwork::Backend::Cpu);
-    (paint(r.shapes, r.seed, r.w, r.h), "cpu")
+    (paint(r.shapes, r.light, r.seed, r.w, r.h), "cpu")
 }
 
 /// Work through the queued requests, one at a time (looking for the GPU first, if that is still to be done).
