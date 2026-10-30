@@ -53,6 +53,34 @@ A film's `main` usually hands its command line to `brushwork::run` (one frame: `
 `brushwork::run_clip` (a stretch: `oilclip <t0> <t1> <dir>`). `brushwork::run_photo_with` paints a photograph.
 `Painting`, `paint_body` and the p5.brush-style `brush_fill` / `brush_wash` / `brush_stroke` lay strokes directly.
 
+## Saying what a shape is, and the light it is in
+
+Unlabelled shapes are painted from what the painter can infer from their size, colour and place. A film can instead
+say what a shape **is** (`brushwork_paint::Role`, with `Po::role`) and the light the scene is in (`Lighting`, on the
+`Style` or per shot with `Rec::light`), and the painter picks the technique a painter would:
+
+| role | painted as |
+|---|---|
+| `Body` | a form or object: blocked in, and for the cast modelled by the light |
+| `Background`, `Sky`, `Haze` | calm planes, wet into wet; the sky and haze fused, edges lost |
+| `Shadow` (`Po::shadow_of(caster)`) | a hint of where a caster's shadow falls, not paint: a glaze over whatever it falls on, each colour under it taken down a value step as deep as the key light is strong, with a touch of the palette's shadow colour; crisp where it leaves the caster, softening with distance |
+| `FormShadow` | the same derivation glazed into a body, its edges lost |
+| `Glaze` | a transparent tint: the paint below shows through |
+| `Light` | a light source (moon, lamp, window): clean luminous paint, softly modelled, fully covered, no cut-in edge |
+| `Highlight`, `Accent`, `Line` | a clean loaded touch; a crisp small detail; one pull of a rigger |
+
+Glows (`Rec::glows`) are scumbled round their light. Forms in the cast turn from the declared key light over a soft
+terminator into a core shadow, with reflected light at the far rim, in their own colour mixed down with the palette's
+darks (`Style::palette`), never grey or black. `Lighting::MOONLIGHT`, `FIRELIGHT`, `DAYLIGHT`, `OVERCAST` and `SUNSET`
+are ready-made; `.at(point)` places the key light in the picture (shadows fall away from it), `.from_dir(dir)` aims it.
+
+```rust
+r.light(Lighting::MOONLIGHT.at([1480.0, 300.0]));
+r.paint("moon", &ell_pts(1480.0, 300.0, 130.0, 130.0, 32, 0.0), wash(rgb(0xF5F0DC)).no_ink().role(Role::Light));
+r.paint("owl", &owl_body, wash(rgb(0xB5652F)));
+r.paint("owl.shadow", &where_it_falls, wash(rgb(0x1D1A1F)).no_ink().shadow_of("owl"));
+```
+
 ## CPU and GPU
 
 The CPU engine is the reference. A frame takes about 3-6 s on one core, and `run_clip` paints frames in parallel.
@@ -81,7 +109,8 @@ from a flicker that was once seen in a film:
 - `an_outline_that_flexes_keeps_its_sweeps`, `a_small_shape_growing_through_every_size_threshold_never_pops`
 - `level_strokes_end_raggedly_not_on_a_vertical_seam`, `same_shape_same_place_paints_identically`
 - `a_fade_fades_and_leaves_without_a_pop`, `a_translucent_wash_is_mixed_down_not_glazed_in_streaks`
-- `a_strap_widening_from_a_line_to_an_area_never_pops`, `close_thin_strips_stay_apart`, ...
+- `a_strap_widening_from_a_line_to_an_area_never_pops`, `close_thin_strips_stay_apart`
+- `a_shadow_is_a_glaze_that_keeps_what_it_falls_on`, `a_shadow_fading_in_and_a_glow_growing_never_pop`, ...
 
 `cargo test --release` runs them on the CPU; `OIL_TEST_BACKEND=gpu cargo test --release --features brushwork/gpu`
 runs them on the GPU. For a rendered film, `flickscan <dir> <first> <last>` lists any block that changes for a frame

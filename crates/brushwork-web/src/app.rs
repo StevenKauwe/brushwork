@@ -13,7 +13,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, ImageData, MessageEvent, PointerEvent, Worker, WorkerOptions, WorkerType};
 
-use crate::scene::{self, PALETTE, Shape};
+use crate::scene::{self, FROM, Kind, LIGHTS, PALETTE, Shape};
 use crate::stabilize;
 
 struct App {
@@ -29,6 +29,9 @@ struct App {
     col: Col,
     subject: bool,
     outline: bool,
+    /// the next shape is a cast shadow or a glowing light
+    kind: Kind,
+    light: scene::Light,
     seed: u32,
     painted: Option<ImageData>,
     /// the painting is of the shapes as they are now
@@ -57,11 +60,11 @@ impl App {
         self.ctx.fill_rect(0.0, 0.0, self.w as f64, self.h as f64);
         // the shape being drawn, calmed as it will be kept (its end stays on the pen)
         let live = self.drawing.as_ref().map(|d| stabilize::path(d, self.unit(), false));
-        let mut all: Vec<(&[[f64; 2]], Col, bool)> = self.shapes.iter().map(|s| (s.pts.as_slice(), s.col, s.outline)).collect();
+        let mut all: Vec<(&[[f64; 2]], Col, bool, Kind)> = self.shapes.iter().map(|s| (s.pts.as_slice(), s.col, s.outline, s.kind)).collect();
         if let Some(d) = &live {
-            all.push((d.as_slice(), self.col, self.outline));
+            all.push((d.as_slice(), self.col, self.outline, self.kind));
         }
-        for (pts, col, outline) in all {
+        for (pts, col, outline, kind) in all {
             let Some(first) = pts.first() else { continue };
             self.ctx.begin_path();
             self.ctx.move_to(first[0], first[1]);
@@ -69,9 +72,15 @@ impl App {
                 self.ctx.line_to(p[0], p[1]);
             }
             self.ctx.close_path();
-            self.ctx.set_fill_style_str(&hex(col));
+            // (a shadow shows where it falls, as a dusky veil; the painter derives its colour)
+            self.ctx.set_fill_style_str(&if kind == Kind::Shadow { "rgba(29, 26, 48, 0.45)".to_string() } else { hex(col) });
             self.ctx.fill();
-            if outline {
+            if kind == Kind::Glow {
+                self.ctx.set_stroke_style_str("#fff6d8");
+                self.ctx.set_line_width(3.0);
+                self.ctx.stroke();
+            }
+            if outline && kind == Kind::Plain {
                 self.ctx.set_stroke_style_str("#2a2420");
                 self.ctx.set_line_width(1.5);
                 self.ctx.stroke();
@@ -126,6 +135,8 @@ impl App {
         msg.push(&JsValue::from_f64(self.w as f64));
         msg.push(&JsValue::from_f64(self.h as f64));
         msg.push(&JsValue::from_str(if self.force_cpu { "cpu" } else { "auto" }));
+        msg.push(&JsValue::from_f64(self.light.preset as f64));
+        msg.push(&JsValue::from_f64(self.light.from as f64));
         let _ = self.worker.post_message(&msg);
         self.status("Painting…", Some(0.0));
         self.show();
@@ -215,6 +226,8 @@ pub fn app_start() -> Result<(), JsValue> {
         col: rgb(PALETTE[3]),
         subject: true,
         outline: true,
+        kind: Kind::Plain,
+        light: scene::Light::default(),
         seed: 1,
         painted: None,
         fresh: false,
@@ -313,6 +326,41 @@ pub fn app_start() -> Result<(), JsValue> {
         a.outline = !a.outline;
         set_pressed(&a.doc, "outline", a.outline);
     });
+    click(&doc, "shadow", &app, |a| {
+        a.kind = if a.kind == Kind::Shadow { Kind::Plain } else { Kind::Shadow };
+        set_pressed(&a.doc, "shadow", a.kind == Kind::Shadow);
+        set_pressed(&a.doc, "glow", a.kind == Kind::Glow);
+        a.show();
+    });
+    click(&doc, "glow", &app, |a| {
+        a.kind = if a.kind == Kind::Glow { Kind::Plain } else { Kind::Glow };
+        set_pressed(&a.doc, "shadow", a.kind == Kind::Shadow);
+        set_pressed(&a.doc, "glow", a.kind == Kind::Glow);
+        a.show();
+    });
+    let light_text = |a: &App| {
+        if let Some(b) = el(&a.doc, "light") {
+            b.set_text_content(Some(&format!("Light: {}", LIGHTS[a.light.preset].0)));
+        }
+        if let Some(b) = el(&a.doc, "from") {
+            b.set_text_content(Some(&format!("From the {}", FROM[a.light.from].0)));
+        }
+    };
+    light_text(&app.borrow());
+    click(&doc, "light", &app, |a| {
+        a.light.preset = (a.light.preset + 1) % LIGHTS.len();
+        a.fresh = false;
+        if let Some(b) = el(&a.doc, "light") {
+            b.set_text_content(Some(&format!("Light: {}", LIGHTS[a.light.preset].0)));
+        }
+    });
+    click(&doc, "from", &app, |a| {
+        a.light.from = (a.light.from + 1) % FROM.len();
+        a.fresh = false;
+        if let Some(b) = el(&a.doc, "from") {
+            b.set_text_content(Some(&format!("From the {}", FROM[a.light.from].0)));
+        }
+    });
     click(&doc, "undo", &app, |a| {
         a.shapes.pop();
         a.fresh = false;
@@ -389,7 +437,7 @@ pub fn app_start() -> Result<(), JsValue> {
             let n = d.len();
             let area = (0..n).map(|i| d[i][0] * d[(i + 1) % n][1] - d[(i + 1) % n][0] * d[i][1]).sum::<f64>().abs() / 2.0;
             if n >= 3 && area > 30.0 {
-                a.shapes.push(Shape { col: a.col, subject: a.subject, outline: a.outline, pts: d });
+                a.shapes.push(Shape { col: a.col, subject: a.subject && a.kind == Kind::Plain, outline: a.outline, kind: a.kind, pts: d });
                 a.fresh = false;
                 a.show_painted = false;
                 a.status("Draw more shapes, or Paint.", None);

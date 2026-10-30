@@ -62,6 +62,24 @@ fn smoothk(a: f32, b: f32, x: f32) -> f32 {
     return t * t * (3.0 - 2.0 * t);
 }
 
+// the shape mask's value at a pixel (-1 outside its box); masks are stored in 16 x 16 blocks: 0 all outside, 1 all
+// inside, n >= 2 the block's values at n - 2
+fn mask_at(s: Cmd, x: i32, y: i32) -> f32 {
+    let mx = x - s.mask_ox;
+    let my = y - s.mask_oy;
+    if (mx < 0 || my < 0 || u32(mx) >= s.mask_w || u32(my) >= s.mask_h) {
+        return -1.0;
+    }
+    let bw = (s.mask_w + 15u) / 16u;
+    let blk = masks[s.mask_off + (u32(my) / 16u) * bw + u32(mx) / 16u];
+    if (blk == 0u) {
+        return 0.0;
+    } else if (blk == 1u) {
+        return 1.0;
+    }
+    return bitcast<f32>(masks[blk - 2u + (u32(my) % 16u) * 16u + u32(mx) % 16u]);
+}
+
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     if (gid.x >= WI || gid.y >= HI) {
@@ -84,7 +102,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
             th = th * (1.0 - k);
             continue;
         }
-        if (s.kind != 0u || x < s.x0 || x > s.x1 || y < s.y0 || y > s.y1) {
+        if (x < s.x0 || x > s.x1 || y < s.y0 || y > s.y1) {
+            continue;
+        }
+        if (s.kind == 2u) {
+            // a glaze over a shape: the paint below, seen through a thin layer of colour (Painting::glaze_area)
+            let m = mask_at(s, x, y);
+            if (m <= 0.0) {
+                continue;
+            }
+            let gx = f32(x) + 0.5 - s.cx;
+            let gy = f32(y) + 0.5 - s.cy;
+            let gu = gx * s.cs + gy * s.sn;
+            let gv = -gx * s.sn + gy * s.cs;
+            if (s.tool == 1u) {
+                let g = m * (0.72 + 0.28 * noise(gu / (60.0 * s.z), gv / (16.0 * s.z), s.id));
+                c0 = c0 + (vec3<f32>(s.col_r, s.col_g, s.col_b) - c0) * g;
+            } else {
+                let g = m * (0.74 + 0.16 * noise(gu / (90.0 * s.z), gv / (28.0 * s.z), s.id ^ 5u) + 0.1 * noise(gu / (16.0 * s.z), gv / (3.4 * s.z), s.id));
+                if (s.tool == 2u) {
+                    // a shadow: the paint here taken down by its own shadow colour (shade_paint in lib.rs)
+                    let lw = vec3<f32>(0.3, 0.59, 0.11);
+                    let v = dot(c0, lw);
+                    let mm = c0 + (vec3<f32>(s.col_r, s.col_g, s.col_b) - c0) * s.bend;
+                    let l = max(dot(mm, lw), 1e-4);
+                    let sh = clamp(mm * (v * (1.0 - s.along) / l), vec3<f32>(0.0), vec3<f32>(1.0));
+                    c0 = c0 + (sh - c0) * g;
+                } else {
+                    c0 = c0 * (vec3<f32>(1.0) - g * (vec3<f32>(1.0) - vec3<f32>(s.col_r, s.col_g, s.col_b)));
+                }
+            }
+            continue;
+        }
+        if (s.kind != 0u) {
             continue;
         }
         let dx = f32(x) + 0.5 - s.cx;

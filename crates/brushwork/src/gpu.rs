@@ -22,7 +22,8 @@
 // Without the `gpu` feature nothing records strokes (the backend can't be chosen), so the recorder's fields go unread.
 #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
 
-/// One planned stroke (or, with `kind == 1`, a full-frame glaze), as the GPU reads it. All scalars, 4 bytes each.
+/// One planned stroke (or, with `kind == 1`, a full-frame glaze; with `kind == 2`, a glaze over one shape's mask),
+/// as the GPU reads it. All scalars, 4 bytes each.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Cmd {
@@ -71,7 +72,10 @@ pub(crate) struct Cmd {
     pub x1: i32,
     pub y0: i32,
     pub y1: i32,
-    /// 0 stroke, 1 glaze (col = the glaze colour, opacity = its strength)
+    /// 0 stroke, 1 glaze (col = the glaze colour, opacity = its strength), 2 a shape's glaze (col = the factors
+    /// the paint below is multiplied by, under the mask handed over; cx, cy, sn, cs, z, id: its brushed grain) or,
+    /// with tool = 1, a scumble (col = the light paint dragged over it), or with tool = 2 a shadow (col = the shadow
+    /// colour, bend = how much of it is worked in, along = the value step)
     pub kind: u32,
     pub _pad: [u32; 15],
 }
@@ -145,6 +149,45 @@ impl Recorder {
                 }
             }
         }
+        self.cmds.push(c);
+        self.bands.push(bands);
+    }
+    /// A glaze over the mask handed over last (`use_mask`): the paint below multiplied by `tint` where the mask
+    /// covers it, with a faint brushed grain along `dir` (sin, cos) from `anchor`.
+    /// `mode` 0 a glaze (`tint` multiplies the paint), 1 a scumble (`tint` is the paint dragged over it), 2 a shadow
+    /// (`tint` is the shadow colour, worked in by `mix` with the value taken down by `step`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn glaze_area(&mut self, tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], z: f32, id: u32, mode: u32, mix: f32, step: f32) {
+        let (off, o, sz) = self.mask.expect("a shape's glaze needs its mask handed over first (Recorder::use_mask)");
+        let (x0, y0) = (o[0].max(0), o[1].max(0));
+        let (x1, y1) = ((o[0] + sz[0] as i32 - 1).min(super::WI as i32 - 1), (o[1] + sz[1] as i32 - 1).min(super::HI as i32 - 1));
+        if x1 < x0 || y1 < y0 {
+            return;
+        }
+        let c = Cmd {
+            col: tint,
+            cx: anchor[0],
+            cy: anchor[1],
+            sn: dir[0],
+            cs: dir[1],
+            z,
+            id,
+            kind: 2,
+            tool: mode,
+            bend: mix,
+            along: step,
+            mask_off: off,
+            mask_ox: o[0],
+            mask_oy: o[1],
+            mask_w: sz[0] as u32,
+            mask_h: sz[1] as u32,
+            x0,
+            x1,
+            y0,
+            y1,
+            ..Default::default()
+        };
+        let bands = ((y0 as usize / TILE) as u32..=(y1 as usize / TILE) as u32).map(|t| (t, x0, x1)).collect();
         self.cmds.push(c);
         self.bands.push(bands);
     }

@@ -22,7 +22,7 @@
 mod gpu;
 
 use brushwork_paint::prelude::*;
-use brushwork_paint::{Item, Kind};
+use brushwork_paint::{Item, Kind, Lighting, Role};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -54,9 +54,15 @@ pub struct Style {
     pub hole_tags: &'static [&'static str],
     /// The opt-in depth style map (`OIL_DEPTH`): which distance band a family is in. None: everything is Mid.
     pub bands: Option<fn(&str) -> Band>,
+    /// The light the film is seen in, unless a shot says otherwise (`Rec::light`). None: a plain light from the
+    /// upper left.
+    pub lighting: Option<Lighting>,
+    /// The film's palette (0-255 colours): shadows are mixed from it, so they harmonise with everything else. Empty:
+    /// shadows are mixed with the ambient light's colour.
+    pub palette: &'static [Col],
 }
 impl Style {
-    pub const DEFAULT: Style = Style { cast: &[], airy: &["sky", "sun", "far"], leaf_tags: &[], hole_tags: &[], bands: None };
+    pub const DEFAULT: Style = Style { cast: &[], airy: &["sky", "sun", "far"], leaf_tags: &[], hole_tags: &[], bands: None, lighting: None, palette: &[] };
 }
 /// Where strokes are laid: on the CPU (the reference) or on the GPU (the `gpu` feature; see gpu.rs).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -337,8 +343,10 @@ impl Painting {
         let (marks, lips, edge_soft) = match s.tool {
             // BODY scales the paint's relief: 1 is thick impasto, the default is thin paint that only just shows
             // how it was put on
-            Tool::Flat => (0.26 * BODY, 0.6 * BODY, 1.2),
-            Tool::Filbert => (0.2 * BODY, 0.5 * BODY, 2.2),
+            // (the sides of a big brush are not razor-cut: its outer hairs splay and carry less paint, so its
+            // margin softens with its width, and broad strokes overlap as soft-sided bands, never as rectangles)
+            Tool::Flat => (0.26 * BODY, 0.6 * BODY, 1.2 + 0.03 * s.width),
+            Tool::Filbert => (0.2 * BODY, 0.5 * BODY, 2.2 + 0.03 * s.width),
             // a fine round loaded with paint (a rigger) leaves a line with clean sides: its soft margin shrinks with
             // the line, so a thin line stays a line and two close ones stay two
             Tool::Round => (0.07 * BODY, 0.2 * BODY, (0.55 + 0.14 * s.width).min(1.4)),
@@ -578,6 +586,77 @@ impl Painting {
         }
     }
 
+    /// A glaze over a shape: a thin transparent layer of one colour, the paint below seen through it (multiplied by
+    /// `tint`), its texture and relief left as they are. `mask` (origin `o`, size `sz`) is how much of it lies on
+    /// each pixel (its softness is the glaze's edge); a faint grain runs along `dir` (sin, cos) from `anchor`, as a
+    /// soft brush leaves in a glaze. The GPU does the same (`Recorder::glaze_area`).
+    fn glaze_area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], id: u32) {
+        self.area(mask, o, sz, tint, anchor, dir, id, Layer::Glaze)
+    }
+
+    /// A shadow glazed over an area: the paint at each point taken down by its own shadow colour (`shade_paint`),
+    /// so every colour it falls on stays itself, a step darker.
+    fn shade_area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], glaze: ([f32; 3], f32, f32), anchor: [f32; 2], dir: [f32; 2], id: u32) {
+        self.area(mask, o, sz, glaze.0, anchor, dir, id, Layer::Shade(glaze.1, glaze.2))
+    }
+
+    /// A scumble over an area: light paint `col` dragged thinly over what is there (`mask` how much of it), broken by
+    /// the canvas's tooth (a coarse, dry grain), the way a painter lays a glow round a light or a veil of haze.
+    fn scumble_area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], col: [f32; 3], anchor: [f32; 2], dir: [f32; 2], id: u32) {
+        self.area(mask, o, sz, col, anchor, dir, id, Layer::Scumble)
+    }
+
+    fn area(&mut self, mask: &[f32], o: [i32; 2], sz: [usize; 2], tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], id: u32, layer: Layer) {
+        let z = zoom();
+        if let Some(r) = self.rec.as_mut() {
+            r.use_mask(mask, o, sz);
+            let (mode, mix, step) = match layer {
+                Layer::Glaze => (0, 0.0, 0.0),
+                Layer::Scumble => (1, 0.0, 0.0),
+                Layer::Shade(mix, step) => (2, mix, step),
+            };
+            r.glaze_area(tint, anchor, dir, z, id, mode, mix, step);
+            return;
+        }
+        for my in 0..sz[1] {
+            let y = my as i32 + o[1];
+            if y < 0 || y >= HI as i32 {
+                continue;
+            }
+            for mx in 0..sz[0] {
+                let x = mx as i32 + o[0];
+                let m = mask[my * sz[0] + mx];
+                if x < 0 || x >= WI as i32 || m <= 0.0 {
+                    continue;
+                }
+                let (gx, gy) = (x as f32 + 0.5 - anchor[0], y as f32 + 0.5 - anchor[1]);
+                let (gu, gv) = (gx * dir[1] + gy * dir[0], -gx * dir[0] + gy * dir[1]);
+                let c = &mut self.col[y as usize * WI + x as usize];
+                match layer {
+                    Layer::Scumble => {
+                        let g = m * (0.72 + 0.28 * noise(gu / (60.0 * z), gv / (16.0 * z), id));
+                        for k in 0..3 {
+                            c[k] += (tint[k] - c[k]) * g;
+                        }
+                    }
+                    Layer::Glaze => {
+                        let g = m * glaze_grain(gu, gv, z, id);
+                        for k in 0..3 {
+                            c[k] *= 1.0 - g * (1.0 - tint[k]);
+                        }
+                    }
+                    Layer::Shade(mix, step) => {
+                        let g = m * glaze_grain(gu, gv, z, id);
+                        let sh = shade_paint(*c, tint, mix, step);
+                        for k in 0..3 {
+                            c[k] += (sh[k] - c[k]) * g;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Light the paint's relief from the upper left and add the canvas weave where it is thin.
     pub fn lit(&self) -> Vec<u8> {
         let mut out = vec![0u8; WI * HI * 3];
@@ -650,8 +729,8 @@ impl Painting {
 /// What the painter knows about the scene beyond its shapes: where the light comes from and what is being looked at.
 #[derive(Clone, Copy)]
 struct Scene {
-    /// Towards the light, on the canvas (unit).
-    light: [f32; 2],
+    /// The light the frame is seen in.
+    l: Light,
     focus: [f32; 2],
     reach: f32,
 }
@@ -669,8 +748,12 @@ thread_local! {
     /// How far back the shape being painted sits, as a painter treats it (see `softness`): 0 the focal subject,
     /// 1 the far distance and the sky.
     static SOFT: std::cell::Cell<f32> = const { std::cell::Cell::new(MID_SOFT) };
+    /// How the shape being painted is to be treated beyond its size and place (from its role; see `Mode`).
+    static MODE: std::cell::Cell<Mode> = const { std::cell::Cell::new(Mode { clean: 0.0, model: 0.0, line: 0.0 }) };
     // one frame is painted start to finish on one thread
     static SCENE: std::cell::Cell<Option<Scene>> = const { std::cell::Cell::new(None) };
+    /// The frame's light (also when the scene's modelling is switched off: shadows a film draws still need it).
+    static FRAME_LIGHT: std::cell::Cell<Option<Light>> = const { std::cell::Cell::new(None) };
 }
 /// How much of what is painted now is laid (1 = all of it). A painter's decisions about a shape go by its size,
 /// and a size threshold crossed by a shape that grows or shrinks by a pixel would switch the treatment in one frame:
@@ -687,6 +770,39 @@ impl Fade {
 impl Drop for Fade {
     fn drop(&mut self) {
         FADE.with(|f| f.set(self.0));
+    }
+}
+
+/// How an area layer lies on the paint (`Painting::area`).
+#[derive(Clone, Copy)]
+enum Layer {
+    /// a transparent colour: the paint multiplied by it
+    Glaze,
+    /// light paint dragged thinly over it
+    Scumble,
+    /// a shadow: the paint taken down by its own shadow colour (`shade_paint` with this mix and step)
+    Shade(f32, f32),
+}
+
+/// What a shape's role asks of its painting, each by degrees (0 to 1) so that an inferred role can cross-fade:
+/// `clean`, paint that picks up nothing and is laid evenly with no band cut in round it (a light, a highlight);
+/// `model`, a light source's soft modelling (lightest in its middle, a little greyer and cooler at its rim);
+/// `line`, linework drawn as a shape (one pull of a fine brush, whatever its size).
+#[derive(Clone, Copy, Default)]
+struct Mode {
+    clean: f32,
+    model: f32,
+    line: f32,
+}
+struct ModeGuard(Mode);
+impl ModeGuard {
+    fn set(m: Mode) -> ModeGuard {
+        ModeGuard(MODE.with(|c| c.replace(m)))
+    }
+}
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        MODE.with(|c| c.set(self.0));
     }
 }
 
@@ -725,6 +841,10 @@ fn towards_veil(c: [f32; 3], pull: f32) -> [f32; 3] {
     let veil = VEIL.with(|v| v.get());
     std::array::from_fn(|k| (c[k] + (veil[k] - c[k]) * pull).clamp(0.0, 1.0))
 }
+/// The frame's light (a plain one outside a frame: a painting laid stroke by stroke, a photo).
+fn frame_light() -> Light {
+    FRAME_LIGHT.with(|f| f.get()).unwrap_or_else(|| Light::from(&PLAIN_LIGHT, None, &[]))
+}
 fn scene() -> Option<Scene> {
     if LIGHT.load(Ordering::Relaxed) { SCENE.with(|s| s.get()) } else { None }
 }
@@ -743,22 +863,122 @@ impl Scene {
             (0.55 + (v - 0.55) * (1.0 - 0.07 * away) + [-0.004, 0.0, 0.008][k] * away).clamp(0.0, 1.0)
         })
     }
-    /// One light, stated plainly: `side` runs from -1 (the side of a form turned to the light) to +1 (the side
-    /// turned away). Light side lighter and warmer; shadow side darker, cooler and greyer.
-    fn turned(&self, c: [f32; 3], side: f32, form: f32) -> [f32; 3] {
+    /// The side of a form turned from the light, as a painter models it: `side` runs from -1 (turned to the light)
+    /// to +1 (turned away). The form turns into shadow over a soft terminator, is darkest just past it (the core
+    /// shadow) and picks up a little reflected light at its far rim; the shadow is the form's own colour mixed down
+    /// with the scene's shadow pigment (see `Light::shade`, here from the shape's table `tab`), the lit side a
+    /// little lighter and towards the key light's colour. (It used to switch to shadow over a narrow band and grey
+    /// and darken the colour itself: a cream belly got a hard-edged grey wedge across it.)
+    fn turned(&self, tab: &ShadeTable, c: [f32; 3], side: f32, form: f32) -> [f32; 3] {
         let side = side.clamp(-1.0, 1.0);
-        // the form turns away from the light quite suddenly (the shadow edge), is darkest just past that edge, and
-        // picks up a little light again at its far rim from whatever it sits on
-        let shadow = smooth(-0.05, 0.35, side);
-        let core = (-((side - 0.45) / 0.3).powi(2)).exp();
-        let lit = smooth(0.1, -0.9, side);
-        let grey = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
-        let dark = 1.0 - form * (0.34 * shadow + 0.12 * core);
-        let warm = form * 0.22 * lit;
-        std::array::from_fn(|k| {
-            let v = grey + (c[k] - grey) * (1.0 - 0.06 * form * shadow);
-            (v * dark * (1.0 + [1.0, 0.8, 0.35][k] * warm) + [0.035, 0.02, 0.0][k] * warm + [0.0, 0.006, 0.04][k] * form * shadow).clamp(0.0, 1.0)
-        })
+        let shadow = smooth(0.0, 0.65, side);
+        let core = 0.2 * (-((side - 0.7) / 0.22).powi(2)).exp();
+        let reflect = 0.3 * smooth(0.75, 1.0, side);
+        let depth = (form * (0.55 * shadow + core - reflect)).clamp(0.0, 1.0);
+        let lit = form * smooth(0.0, -0.9, side);
+        let d = tab.at(depth);
+        let key = self.l.key;
+        std::array::from_fn(|k| (d[k] + (c[k] * (1.0 + 0.08 * self.l.strength) * (0.9 + 0.1 * key[k]) - c[k]) * lit).clamp(0.0, 1.0))
+    }
+}
+
+/// The light a frame is seen in, as the painter works with it (0-1 colours, canvas pixels).
+#[derive(Clone, Copy)]
+struct Light {
+    /// Towards the key light (unit), or the key light's place.
+    dir: [f32; 2],
+    at: Option<[f32; 2]>,
+    key: [f32; 3],
+    strength: f32,
+    /// The paint shadows are mixed down with: the palette's colour nearest the ambient light's, among its darks
+    /// (or a deep mix of the ambient light's colour).
+    pigment: [f32; 3],
+}
+/// A plain light from the upper left (what every frame had before lighting could be declared).
+const PLAIN_LIGHT: Lighting = Lighting { key_dir: [-0.64, -0.77], key_at: None, key: [255.0, 246.0, 232.0], strength: 0.6, ambient: [96.0, 104.0, 140.0] };
+
+fn lum3(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+impl Light {
+    fn from(l: &Lighting, at: Option<[f32; 2]>, palette: &[Col]) -> Light {
+        let c = |v: Col| [v[0] as f32 / 255.0, v[1] as f32 / 255.0, v[2] as f32 / 255.0];
+        let ambient = c(l.ambient);
+        let n = (l.key_dir[0].hypot(l.key_dir[1]) as f32).max(1e-6);
+        let dark = |p: [f32; 3]| lum3(p) < 0.4;
+        let dist = |p: [f32; 3]| {
+            // nearness in hue and in value to a deep version of the ambient light
+            let g = [ambient[0] * 0.55, ambient[1] * 0.55, ambient[2] * 0.55];
+            (0..3).map(|k| (p[k] - g[k]).powi(2)).sum::<f32>()
+        };
+        let pigment = palette.iter().map(|v| c(*v)).filter(|p| dark(*p)).min_by(|a, b| dist(*a).total_cmp(&dist(*b))).unwrap_or([
+            ambient[0] * 0.55,
+            ambient[1] * 0.55,
+            ambient[2] * 0.55,
+        ]);
+        Light { dir: [l.key_dir[0] as f32 / n, l.key_dir[1] as f32 / n], at, key: c(l.key), strength: l.strength.clamp(0.0, 1.0) as f32, pigment }
+    }
+    /// Towards the key light from `q`.
+    fn towards(&self, q: [f32; 2]) -> [f32; 2] {
+        match self.at {
+            Some(a) => {
+                let (dx, dy) = (a[0] - q[0], a[1] - q[1]);
+                let l = dx.hypot(dy).max(1e-3);
+                // (right at the light, any way is towards it: fade to the declared direction there)
+                let k = smooth(0.0, 40.0, l);
+                let v = [dx / l * k + self.dir[0] * (1.0 - k), dy / l * k + self.dir[1] * (1.0 - k)];
+                let n = v[0].hypot(v[1]).max(1e-6);
+                [v[0] / n, v[1] / n]
+            }
+            None => self.dir,
+        }
+    }
+    /// The colour a painter mixes for paint that looks `local` in the light, where the key light does not reach
+    /// (`depth` 1, a full cast shadow) or only partly (`depth` below 1, a form turning away). Not the local colour
+    /// gone towards black or grey, nor gone to mud: the local colour with a touch of the scene's shadow colour (from
+    /// its palette, nearest its ambient light) worked in, taken down a value step that is as deep as the key light
+    /// is strong: cool shadows under a warm light, and so on.
+    fn shade(&self, local: [f32; 3], depth: f32) -> [f32; 3] {
+        let depth = depth.clamp(0.0, 1.0);
+        let v = lum3(local);
+        if depth <= 0.0 || v <= 1e-4 {
+            return local;
+        }
+        let target = v * (1.0 - depth * self.strength * 0.72);
+        // (a little of the shadow colour, as a painter adds a touch of it to the local colour on the palette:
+        // mixed as pigment, a blue into an orange goes green, which is not what a shadow on an orange looks like)
+        let m: [f32; 3] = std::array::from_fn(|k| local[k] + (self.pigment[k] - local[k]) * 0.16 * depth);
+        let l = lum3(m).max(1e-4);
+        m.map(|x| (x * target / l).clamp(0.0, 1.0))
+    }
+    /// What a shadow glaze of `depth` does to paint that is there: `(pigment, mix, step)` for `shade_paint`.
+    fn glaze_of(&self, depth: f32) -> ([f32; 3], f32, f32) {
+        let depth = depth.clamp(0.0, 1.0);
+        (self.pigment, 0.16 * depth, depth * self.strength * 0.72)
+    }
+}
+
+/// A shadow glazed over paint `c`: a touch (`mix`) of the shadow colour `pig` worked in, and its value taken down by
+/// `step` (the same as `Light::shade`, here for whatever paint is at a pixel; strokes.wgsl has the same).
+fn shade_paint(c: [f32; 3], pig: [f32; 3], mix: f32, step: f32) -> [f32; 3] {
+    let v = lum3(c);
+    let m: [f32; 3] = std::array::from_fn(|k| c[k] + (pig[k] - c[k]) * mix);
+    let l = lum3(m).max(1e-4);
+    m.map(|x| (x * v * (1.0 - step) / l).clamp(0.0, 1.0))
+}
+
+/// `Light::shade` for one local colour at nine depths, interpolated (a form's every stroke needs it).
+struct ShadeTable([[f32; 3]; 9]);
+impl ShadeTable {
+    fn new(l: &Light, local: [f32; 3]) -> ShadeTable {
+        ShadeTable(std::array::from_fn(|i| l.shade(local, i as f32 / 8.0)))
+    }
+    fn at(&self, depth: f32) -> [f32; 3] {
+        let x = depth.clamp(0.0, 1.0) * 8.0;
+        let i = (x.floor() as usize).min(7);
+        let f = x - i as f32;
+        std::array::from_fn(|k| self.0[i][k] + (self.0[i + 1][k] - self.0[i][k]) * f)
     }
 }
 
@@ -790,6 +1010,34 @@ fn shape_mask(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [usize
 /// how far the shape's edge is lost there (0 found: the strokes stop crisply at the edge; 1 lost: they run on
 /// past it, over the grown margin, into the paint of the same value beyond).
 fn shape_mask_with(pts: &[[f32; 2]], grow: f32, lost: Option<&dyn Fn(usize) -> f32>) -> Option<(Vec<f32>, [i32; 2], [usize; 2])> {
+    let (mut m, o, sz) = blurred_cover(pts, grow)?;
+    match lost {
+        None => {
+            for v in &mut m {
+                *v = smooth(0.22, 0.5, *v);
+            }
+        }
+        Some(lost) => {
+            for y in 0..sz[1] {
+                for x in 0..sz[0] {
+                    let v = &mut m[y * sz[0] + x];
+                    // (inside the shape the blurred coverage is at least one half: only the margin is judged)
+                    if *v > 0.0 && *v < 0.5 {
+                        let l = lost((y + o[1] as usize) * WI + x + o[0] as usize);
+                        *v = smooth(0.44 - 0.3 * l, 0.5, *v);
+                    } else {
+                        *v = smooth(0.22, 0.5, *v);
+                    }
+                }
+            }
+        }
+    }
+    Some((m, o, sz))
+}
+
+/// A shape's coverage over its bounding box (grown by `grow` and a little), blurred twice with a box `grow` wide:
+/// one half on its outline, rising inside and falling outside over about `grow`.
+fn blurred_cover(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [usize; 2])> {
     let pad = grow.ceil() as i32 + 2;
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for p in pts {
@@ -876,27 +1124,6 @@ fn shape_mask_with(pts: &[[f32; 2]], grow: f32, lost: Option<&dyn Fn(usize) -> f
             let d = cnt.max(1) as f32;
             for x in 0..sz[0] {
                 m[y * sz[0] + x] = acc[x] / d;
-            }
-        }
-    }
-    match lost {
-        None => {
-            for v in &mut m {
-                *v = smooth(0.22, 0.5, *v);
-            }
-        }
-        Some(lost) => {
-            for y in 0..sz[1] {
-                for x in 0..sz[0] {
-                    let v = &mut m[y * sz[0] + x];
-                    // (inside the shape the blurred coverage is at least one half: only the margin is judged)
-                    if *v > 0.0 && *v < 0.5 {
-                        let l = lost((y + o[1] as usize) * WI + x + o[0] as usize);
-                        *v = smooth(0.44 - 0.3 * l, 0.5, *v);
-                    } else {
-                        *v = smooth(0.22, 0.5, *v);
-                    }
-                }
             }
         }
     }
@@ -1203,7 +1430,8 @@ fn paint_form_band(
     // spilling 10 px either side, and close twigs, straps and whiskers ran together into one smear.)
     let thick = thickness(pts);
     // how far the shape is a line rather than an area (by degrees: a shape thinning through it changes by degrees)
-    let thin_k = 1.0 - smooth(1.2 * SMALLEST * z, 2.5 * SMALLEST * z, thick);
+    let mode = MODE.with(|m| m.get());
+    let thin_k = (1.0 - smooth(1.2 * SMALLEST * z, 2.5 * SMALLEST * z, thick)).max(mode.line);
     // The brush follows the shape's size continuously. (It used to snap to steps of 1.22x: a shape that swelled
     // across a step boundary, or a blinking eye, re-planned every stroke in it in one frame, which read as a pop.)
     let width = (thick / z * 0.30 * detail).clamp(5.0, 110.0) * z;
@@ -1280,6 +1508,13 @@ fn paint_form_band(
     // window centred on the centroid with the clipped radius missed the visible part entirely).
     let mut spots = plan_slots(pts, c, lo, hi, width, base, seed, long);
     spots.sort_by_key(|(_, id, _)| h32(*id));
+    // A light is covered completely, in two layers, the second across the first: luminous paint with the dark
+    // showing through a gap reads as a hole, not as paint. (By degrees of how much the shape is a light.)
+    if mode.clean > 0.001 {
+        let mut more = plan_slots(pts, c, lo, hi, width, base + 0.9, seed ^ 0x5EED_0001, long);
+        more.sort_by_key(|(_, id, _)| h32(*id));
+        spots.extend(more.into_iter().map(|(q, id, e)| (q, id, e * mode.clean)));
+    }
     if trace() {
         eprintln!(
             "  FORM seed={seed:08x} n={} width={width:.3} base={base:.4} c=({:.2},{:.2}) thick={thick:.1} long={long:.2} soft={soft:.2}",
@@ -1294,6 +1529,8 @@ fn paint_form_band(
     if let Some(r) = p.rec.as_mut() {
         r.use_mask(&mask, o, sz);
     }
+    // the colours of the form turning from the light, mixed once for the whole shape
+    let shade_tab = scene().filter(|_| form > 0.0).map(|sc| ShadeTable::new(&sc.l, col));
     for (q, id, edge_k) in spots {
         // Brushwork within a plane is deliberate: one direction, drifting slowly. Near where the colour ends it
         // turns to run ALONG that edge, so two colours meet with their strokes side by side, never with one
@@ -1323,13 +1560,21 @@ fn paint_form_band(
         // random jump from every stroke to the next made skies and big shapes a patchwork of dabs).
         let lively = 1.0 - soft;
         let field = |s: u32| noise((q[0] - c[0]) / (2.8 * width), (q[1] - c[1]) / (2.8 * width), seed ^ s) - 0.5;
-        let k = 1.0 + 0.10 * field(0xB0) + 0.12 * (hf(id, 4) - 0.5) * (0.3 + 0.7 * lively);
-        let warm = 1.6 * field(0xB1) + 2.0 * (hf(id, 8) - 0.5) * (0.25 + 0.75 * lively);
+        // (Gently: a stroke is a long, broad, straight-sided mark, so a stroke-to-stroke jump in temperature reads as
+        // a rectangle of another colour. The jumps used to be up to 0.06 in red and blue each way, which turned a
+        // dull purple plane into a quilt of brown and blue blocks.) A light source's paint is clean and even.
+        let even = 1.0 - 0.75 * mode.clean;
+        let k = 1.0 + (0.07 * field(0xB0) + 0.05 * (hf(id, 4) - 0.5) * (0.3 + 0.7 * lively)) * even;
+        let warm = (0.8 * field(0xB1) + 0.5 * (hf(id, 8) - 0.5) * (0.25 + 0.75 * lively)) * even;
         // which side of the form this stroke is on
         let lit_col = match scene() {
             Some(sc) => {
-                let across = ((q[0] - c[0]) * -sc.light[0] + (q[1] - c[1]) * -sc.light[1]) / (small * 0.5).max(1.0);
-                sc.turned(col, across, form)
+                let lt = sc.l.towards(c);
+                let across = ((q[0] - c[0]) * -lt[0] + (q[1] - c[1]) * -lt[1]) / (small * 0.5).max(1.0);
+                match &shade_tab {
+                    Some(tab) => sc.turned(tab, col, across, form),
+                    None => col,
+                }
             }
             None => col,
         };
@@ -1340,21 +1585,24 @@ fn paint_form_band(
         // streaked green), and a thin shape, a rigger's line, takes nothing from its neighbours at all.
         let edge_wet = (-(near / (width * 1.1)).powi(2)).exp() * (1.0 - thin_k);
         let (mut own, mut own_alt) = (shifted(lit_col, k, warm), shifted(alt, 1.0, 0.0));
+        if mode.model > 0.0 {
+            // a light is lightest and warmest in its middle and turns a little greyer and cooler towards its rim
+            // (a moon's limb), softly, with no edge cut in round it
+            let rho = ((q[0] - c[0]).hypot(q[1] - c[1]) / (small * 0.5).max(1.0)).min(1.2);
+            let limb = shifted(col, 1.0 - 0.07 * rho * rho, -0.6 * rho * rho);
+            own = std::array::from_fn(|i| own[i] + (limb[i] - own[i]) * mode.model);
+            own_alt = std::array::from_fn(|i| own_alt[i] + (shifted(limb, 1.04, 0.2)[i] - own_alt[i]) * mode.model);
+        }
         // what the brush works into is the paint where it lays, at its middle (a stroke laid inwards from just
         // outside a shape used to load up at its start with whatever lay beyond the edge, often the bare ground)
         let picked = flat_under(&p.flat, q[0], q[1], width * 0.3, col);
-        let scumble = {
-            let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
-            let chroma = col.iter().fold(0.0f32, |m, v| m.max(*v)) - col.iter().fold(1.0f32, |m, v| m.min(*v));
-            0.45 + 0.55 * smooth(0.12, 0.35, lum(col) - lum(picked)) * (1.0 - smooth(0.15, 0.4, chroma))
-        };
         let mut lost = 0.0;
         if edge_wet > 0.01 {
             let r = width * 0.5;
             let wet = wet_under(&p.wet, q[0], q[1], r);
             let under = flat_under(&p.flat, q[0], q[1], r, col);
             lost = 1.0 - smooth(0.05 + 0.06 * soft, 0.22 + 0.1 * soft, contrast(col, under));
-            let blend = edge_wet * wet * lost * (0.14 + 0.3 * soft);
+            let blend = edge_wet * wet * lost * (0.14 + 0.3 * soft) * (1.0 - mode.clean);
             if blend > 0.004 {
                 own = pigment_mix(own, under, blend);
                 own_alt = pigment_mix(own_alt, under, blend);
@@ -1372,10 +1620,10 @@ fn paint_form_band(
                 col: own,
                 alt: own_alt,
                 opacity: opacity * (0.86 + 0.12 * hf(id, 9)) * edge_k,
-                // (a found edge is cut in cleanly; where it is lost the brush drags the neighbour in; deep inside, a
-                // light, quiet paint scumbled over darker paint drags its tone up into broken texture, as a moon's
-                // pale paint over the night sky does, but a strong colour over another is kept clean of the mud)
-                pickup: ((0.22 + 0.3 * hf(id, 10)) * (scumble + (1.0 - scumble) * edge_wet * (0.3 + 0.7 * lost)) * (1.0 - 0.85 * thin_k) + pickup_add)
+                // (a found edge is cut in cleanly; where it is lost the brush drags the neighbour in; deep inside it
+                // carries its own paint. A light's paint is kept clean: the moon used to drag the night sky up through
+                // it in dark streaks)
+                pickup: ((0.22 + 0.3 * hf(id, 10)) * (0.3 + 0.7 * edge_wet * (0.3 + 0.7 * lost)) * (1.0 - 0.85 * thin_k) * (1.0 - mode.clean) + pickup_add)
                     .min(0.85),
                 load: (0.6 + 0.4 * hf(id, 11)) * body,
                 // the stroke's bristles belong to its place on its shape, not to how many strokes came before it
@@ -1407,6 +1655,7 @@ fn paint_form_band(
     // the cut-in edge comes in by degrees as a shape grows past the size that has one (by its true breadth: a
     // thin shape has no room for a band cut in along each side)
     let contour_k = smooth(SMALLEST * 3.5 * z, SMALLEST * 4.5 * z, thick);
+    let contour_k = contour_k * (1.0 - mode.clean);
     if contour_k > 0.001 && contour {
         let _contour = Fade::set(contour_k);
         // lost and found: a modelled subject keeps much of its cut-in edge everywhere; scenery only where it
@@ -1699,6 +1948,203 @@ fn paint_contour(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3
     }
 }
 
+/// How much of a glaze a soft brush leaves at a point (`u` along its strokes, `v` across): never quite even, a
+/// little more where the strokes overlapped and less where the brush ran thin. (The GPU has the same, strokes.wgsl.)
+fn glaze_grain(u: f32, v: f32, z: f32, id: u32) -> f32 {
+    0.74 + 0.16 * noise(u / (90.0 * z), v / (28.0 * z), id ^ 5) + 0.1 * noise(u / (16.0 * z), v / (3.4 * z), id)
+}
+
+/// The long axis of a set of points, as an angle (for the grain of a glaze).
+fn axis_of(pts: &[[f32; 2]]) -> f32 {
+    let n = pts.len().max(1) as f32;
+    let c = [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n];
+    let (mut sxx, mut sxy, mut syy) = (0.0f32, 0.0f32, 0.0f32);
+    for q in pts {
+        let (dx, dy) = (q[0] - c[0], q[1] - c[1]);
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    0.5 * (2.0 * sxy).atan2(sxx - syy)
+}
+
+/// A cast shadow, the way a painter indicates one: not a patch of dark paint, but a glaze over what it falls on.
+/// `pts` is where it falls; `caster` (if known) what casts it. Its colour is derived from what it falls on and the
+/// scene's light: at every point the paint it falls on is taken down by its own shadow colour (`shade_paint`: a touch
+/// of the palette's shadow colour worked in, a value step as deep as the light is strong, `depth` 1 for a full
+/// shadow), so each colour under it stays itself, darker and cooler. (One glaze colour averaged over everything
+/// under it turned a cream belly blue where the shadow also covered the sky.) Its edge is crisp where it leaves the caster and softens with distance
+/// from it (the penumbra); `soft` (0 to 1) softens it all over (a form shadow's edges are lost).
+fn paint_cast_shadow(p: &mut Painting, pts: &[[f32; 2]], caster: Option<&[[f32; 2]]>, depth: f32, soft: f32, id: u32) {
+    let fade = FADE.with(|f| f.get()) * PREMIX.with(|p| p.get());
+    if fade <= 0.002 || pts.len() < 3 {
+        return;
+    }
+    let light = frame_light();
+    let z = zoom();
+    let thick = thickness(pts);
+    // the widest the penumbra gets
+    // (it widens with how far the shadow reaches from what casts it, as a real penumbra does)
+    let ext = {
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for q in pts {
+            for k in 0..2 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+        (hi[0] - lo[0]).max(hi[1] - lo[1])
+    };
+    // (but never so wide that a narrow shadow dissolves: a painter keeps it readable)
+    let pen = (((thick * 0.2 + ext * 0.05).min(90.0 * z) + 3.0 * z) * (0.4 + 0.6 * soft.max(0.6))).min(thick * 0.3 + 2.0 * z);
+    let Some((mut m, o, sz)) = blurred_cover(pts, pen) else { return };
+    let reach = caster.map_or(1.0, |c| (thickness(c) * 1.2).max(30.0 * z));
+    // how far each point is from what casts it, measured on a coarse grid and interpolated (it changes slowly)
+    const G: usize = 4;
+    let (gw, gh) = (sz[0] / G + 2, sz[1] / G + 2);
+    let far: Vec<f32> = match caster {
+        Some(c) => (0..gw * gh)
+            .map(|i| {
+                let q = [((i % gw) * G) as f32 + o[0] as f32 + 0.5, ((i / gw) * G) as f32 + o[1] as f32 + 0.5];
+                (-signed_depth(c, q, 0.0)).max(0.0)
+            })
+            .collect(),
+        None => vec![],
+    };
+    for my in 0..sz[1] {
+        for mx in 0..sz[0] {
+            let v = &mut m[my * sz[0] + mx];
+            if *v <= 0.0 {
+                continue;
+            }
+            // how soft the edge is here: crisp next to what casts it, softer the further it falls from it
+            let s = match caster {
+                Some(_) if *v < 0.98 => {
+                    let (gx, gy) = (mx / G, my / G);
+                    let (fx, fy) = ((mx % G) as f32 / G as f32, (my % G) as f32 / G as f32);
+                    let at = |x: usize, y: usize| far[y * gw + x];
+                    let d = (at(gx, gy) * (1.0 - fx) + at(gx + 1, gy) * fx) * (1.0 - fy) + (at(gx, gy + 1) * (1.0 - fx) + at(gx + 1, gy + 1) * fx) * fy;
+                    (soft + (1.0 - soft) * smooth(0.0, reach, d)).clamp(0.0, 1.0)
+                }
+                Some(_) => soft,
+                None => soft.max(0.5),
+            };
+            let w = 0.03 + 0.45 * s;
+            *v = smooth(0.5 - w, 0.5 + w, *v);
+        }
+    }
+    for v in &mut m {
+        *v *= fade;
+    }
+    let glaze = light.glaze_of(depth);
+    let (sn, cs) = (axis_of(pts) + std::f32::consts::FRAC_PI_2).sin_cos();
+    let n = pts.len() as f32;
+    let centre = [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n];
+    p.shade_area(&m, o, sz, glaze, centre, [sn, cs], h32(id ^ 0x51AD));
+    // the plain picture: the shadow now lies on it, for whatever is painted over it later
+    for my in 0..sz[1] {
+        for mx in 0..sz[0] {
+            let (x, y) = (mx as i32 + o[0], my as i32 + o[1]);
+            let g = m[my * sz[0] + mx];
+            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 {
+                let f = &mut p.flat[y as usize * WI + x as usize];
+                let sh = shade_paint(*f, glaze.0, glaze.1, glaze.2);
+                for k in 0..3 {
+                    f[k] += (sh[k] - f[k]) * g;
+                }
+            }
+        }
+    }
+}
+
+/// A transparent wash of colour `col` at strength `k` over what is painted (a tint, a stain, a translucent shade):
+/// a glaze, the paint below seen through it, its edges soft.
+fn paint_glaze(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], k: f32, id: u32) {
+    let fade = FADE.with(|f| f.get());
+    let k = (k * fade).clamp(0.0, 1.0);
+    if k <= 0.002 || pts.len() < 3 {
+        return;
+    }
+    let z = zoom();
+    let thick = thickness(pts);
+    let Some((mut m, o, sz)) = blurred_cover(pts, (thick * 0.08).min(8.0 * z) + 1.5 * z) else { return };
+    for v in &mut m {
+        *v = smooth(0.3, 0.6, *v);
+    }
+    // a thin layer of a colour lets through what its pigment does not absorb
+    let tint: [f32; 3] = std::array::from_fn(|c| 1.0 - k * (1.0 - col[c]));
+    let (sn, cs) = (axis_of(pts)).sin_cos();
+    let n = pts.len() as f32;
+    let centre = [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n];
+    p.glaze_area(&m, o, sz, tint, centre, [sn, cs], h32(id ^ 0x61A2));
+    for my in 0..sz[1] {
+        for mx in 0..sz[0] {
+            let (x, y) = (mx as i32 + o[0], my as i32 + o[1]);
+            let g = m[my * sz[0] + mx];
+            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 {
+                let f = &mut p.flat[y as usize * WI + x as usize];
+                for c in 0..3 {
+                    f[c] *= 1.0 - g * (1.0 - tint[c]);
+                }
+            }
+        }
+    }
+}
+
+/// What casts a drawn shadow: the film's named caster (the biggest shape of that family), or, if it names none, the
+/// cast's shape nearest to it; none if there is neither.
+fn caster_of(items: &[Item], shadow: &Item, cam: Option<Cam>) -> Option<Vec<[f32; 2]>> {
+    let centre = |pts: &[[f32; 2]]| {
+        let n = pts.len().max(1) as f32;
+        [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n]
+    };
+    let (sp, _) = screen(shadow, cam);
+    let sc = centre(&sp);
+    let shapes = items.iter().filter(|it| matches!(it.kind, Kind::Shape { wash: Some(_), .. }) && !matches!(it.role, Role::Shadow | Role::FormShadow));
+    match shadow.caster {
+        Some(f) => shapes
+            .filter(|it| it.family.starts_with(f))
+            .map(|it| screen(it, cam).0)
+            .max_by(|a, b| thickness(a).total_cmp(&thickness(b)).then(a.len().cmp(&b.len()))),
+        None => shapes.filter(|it| is_cast(&it.family)).map(|it| screen(it, cam).0).min_by(|a, b| {
+            let (ca, cb) = (centre(a), centre(b));
+            ((ca[0] - sc[0]).hypot(ca[1] - sc[1])).total_cmp(&(cb[0] - sc[0]).hypot(cb[1] - sc[1]))
+        }),
+    }
+}
+
+/// A glow round a light (`Rec::glows`), as a painter makes one: light paint scumbled thinly over the dark round
+/// it, in short strokes that follow the circle, more of it near the light and less and less further out, so the
+/// dark shows through broken at the rim. (The film draws its glows as additive light; the painter ignored them,
+/// so a moon had no light round it at all.) Rings and strokes are fixed in number and scale with the glow, so a
+/// glow that grows or shrinks keeps its strokes; each stroke is its paint let down with what it lands on.
+fn paint_glow(p: &mut Painting, centre: [f32; 2], radius: f32, col: [f32; 3], a: f32, id: u32) {
+    let z = zoom();
+    let fade = FADE.with(|f| f.get()) * smooth(6.0 * z, 14.0 * z, radius);
+    if fade <= 0.002 || a <= 0.002 {
+        return;
+    }
+    let r = radius.max(1.0);
+    let o = [(centre[0] - r).floor() as i32 - 1, (centre[1] - r).floor() as i32 - 1];
+    let e = [(centre[0] + r).ceil() as i32 + 1, (centre[1] + r).ceil() as i32 + 1];
+    let (o, e) = ([o[0].max(0), o[1].max(0)], [e[0].min(WI as i32), e[1].min(HI as i32)]);
+    if e[0] <= o[0] || e[1] <= o[1] {
+        return;
+    }
+    let sz = [(e[0] - o[0]) as usize, (e[1] - o[1]) as usize];
+    let mut m = vec![0.0f32; sz[0] * sz[1]];
+    for y in 0..sz[1] {
+        for x in 0..sz[0] {
+            let t = ((x as i32 + o[0]) as f32 + 0.5 - centre[0]).hypot((y as i32 + o[1]) as f32 + 0.5 - centre[1]) / r;
+            if t < 1.0 {
+                // the light falls off quickly away from its source
+                m[y * sz[0] + x] = (a * (1.0 - t).powf(1.8) * 1.15).min(0.92) * fade;
+            }
+        }
+    }
+    p.scumble_area(&m, o, sz, col, centre, [0.0, 1.0], h32(id ^ 0x6170));
+}
+
 /// A drawn line or an outline. `lit`: for a closed outline, how strongly to paint the sides that face the light
 /// (the far sides are always painted). `against`: for the outline of a shape, the shape's colour and how much of
 /// the outline to keep where the shape meets its surroundings in the same value (lost and found; see `found_edge`).
@@ -1887,6 +2333,20 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
         p.rec = Some(Box::new(gpu::Recorder::new(p.col.clone())));
     }
     p.view = cam.map_or(1.0, |c| c.zoom as f32).clamp(0.25, 6.0);
+    // the light the frame is seen in: the shot's own, else the film's, else a plain light from the upper left (a
+    // light's place, drawn in the camera's world, is seen through the camera like any shape)
+    let light = {
+        let world = |p: [f64; 2]| cam.map_or(p, |c| c.to_screen(p[0], p[1]));
+        let (l, at) = match rec.lighting {
+            Some((l, on_screen)) => (l, l.key_at.map(|p| if on_screen { p } else { world(p) })),
+            None => {
+                let l = style().lighting.unwrap_or(PLAIN_LIGHT);
+                (l, l.key_at.map(world))
+            }
+        };
+        Light::from(&l, at.map(|p| [p[0] as f32, p[1] as f32]), style().palette)
+    };
+    FRAME_LIGHT.with(|f| f.set(Some(light)));
     // what is being looked at: the film's subjects (its outlined, smaller shapes), as one group
     if LIGHT.load(Ordering::Relaxed) {
         let (mut sum, mut wsum) = ([0.0f32; 2], 0.0f32);
@@ -1911,7 +2371,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
             }
         }
         let focus = if wsum > 0.0 { [sum[0] / wsum, sum[1] / wsum] } else { [WI as f32 / 2.0, HI as f32 / 2.0] };
-        SCENE.with(|s| s.set(Some(Scene { light: [-0.64, -0.77], focus, reach: 0.34 * WI as f32 * p.view })));
+        SCENE.with(|s| s.set(Some(Scene { l: light, focus, reach: 0.34 * WI as f32 * p.view })));
     }
     // the canvas as it stood before the last leaf was painted, and that leaf's colour (see the bite holes below)
     let bare = p.flat.clone();
@@ -1934,6 +2394,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
     let total = rec.items.len().max(1) as f32;
     let progress = PROGRESS.with(|p| p.get());
     let n_items = rec.items.len().max(1) as f32;
+    let frame_items: &[Item] = &rec.items;
     for (i, it) in rec.items.iter().enumerate() {
         if let Some(f) = progress {
             f(i as f32 / n_items);
@@ -1991,7 +2452,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                 reach = reach.max((sz[0].min(sz[1]) as f32 * 0.14).min(12.0 * hz));
             }
             ZOOM.with(|z| z.set(zoom));
-            let light = scene().map_or([-0.64, -0.77], |sc| sc.light);
+            let light = scene().map_or([-0.64, -0.77], |sc| sc.l.dir);
             let at = |x: f32, y: f32| -> f32 {
                 let (gx, gy) = (x.round() as i32, y.round() as i32);
                 if gx < 0 || gy < 0 || gx >= WI as i32 || gy >= HI as i32 { 1.0 } else { gap[gy as usize * WI + gx as usize] }
@@ -2148,10 +2609,62 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     let edge = [ic[0] * 0.55 + c[0] * 0.3, ic[1] * 0.55 + c[1] * 0.3, ic[2] * 0.55 + c[2] * 0.3];
                     c = std::array::from_fn(|k| c[k] + (edge[k] - c[k]) * 0.35 * (1.0 - room));
                 }
+                // What the shape is decides how it is painted (see `brushwork_paint::Role`). A shadow or a glaze is
+                // not paint laid over what is there but a glaze through which it shows.
+                match it.role {
+                    Role::Shadow | Role::FormShadow => {
+                        let caster = (it.role == Role::Shadow).then(|| caster_of(frame_items, it, cam)).flatten();
+                        // (the film's opacity says how present the shadow is, not how dark: it arrives by degrees)
+                        let _present = Fade::set((op / 0.3).min(1.0));
+                        let (depth, soft) = if it.role == Role::Shadow { (1.0, 0.15) } else { (0.7, 1.0) };
+                        paint_cast_shadow(&mut p, &pts, caster.as_deref(), depth, soft, id);
+                        continue;
+                    }
+                    Role::Glaze => {
+                        paint_glaze(&mut p, &pts, c, op.min(1.0), id);
+                        continue;
+                    }
+                    _ => {}
+                }
+                let behind_r = (thick * 0.3).max(2.0 * zoom);
+                let behind = flat_under(&p.flat, centre[0], centre[1], behind_r, c);
+                let behind_wet = wet_under(&p.wet, centre[0], centre[1], behind_r);
+                // Unlabelled, a translucent wash darker than what it lies on is a glaze (an eye's shade, a stain),
+                // by degrees of how translucent and how much darker it is.
+                let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+                let glaze_k = if it.role == Role::Auto && wash.is_some() && fill.is_none() {
+                    smooth(0.85, 0.7, op) * smooth(0.02, 0.08, lum(behind) - lum(c)) * behind_wet
+                } else {
+                    0.0
+                };
+                if glaze_k > 0.001 {
+                    let _g = Fade::set(glaze_k);
+                    paint_glaze(&mut p, &pts, c, op.min(1.0), id);
+                }
+                if glaze_k > 0.999 {
+                    continue;
+                }
+                let _paint = Fade::set(1.0 - glaze_k);
+                // A light source (labelled, or a pale shape on dark paint, which reads as one: a moon, a lit window)
+                // is clean, luminous paint, softly modelled, with no band cut in round it. A highlight is clean,
+                // loaded paint.
+                let light_k = match it.role {
+                    Role::Light => 1.0,
+                    Role::Auto if !is_cast(&it.family) => smooth(0.76, 0.84, lum(c)) * smooth(0.3, 0.18, lum(behind)) * behind_wet,
+                    _ => 0.0,
+                };
+                let clean = if it.role == Role::Highlight { 1.0 } else { light_k };
+                let _mode = ModeGuard::set(Mode { clean, model: light_k, line: if it.role == Role::Line { 1.0 } else { 0.0 } });
+                // the role says how far back it sits, where the film's bands do not
+                match it.role {
+                    Role::Sky | Role::Haze => SOFT.with(|s| s.set(1.0)),
+                    Role::Background => SOFT.with(|s| s.set(s.get().max(0.45))),
+                    Role::Accent | Role::Light | Role::Highlight => SOFT.with(|s| s.set(0.0)),
+                    _ => SOFT.with(|s| s.set(s.get() * (1.0 - light_k))),
+                }
                 let _premix = Premix::set(if wash.is_some() { op.min(1.0) } else { 1.0 });
                 let n = pts.len() as f32;
                 let mid = [pts.iter().map(|q| q[0]).sum::<f32>() / n, pts.iter().map(|q| q[1]).sum::<f32>() / n];
-                let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
                 // Small things get their own treatments (below); near the size where a thing stops being small, the
                 // small and the full treatment are cross-faded, so a shape that shrinks or grows by a pixel (a moon
                 // rising, an eye blinking) changes by degrees, not in one frame. Likewise how much a small thing is an
@@ -2170,13 +2683,14 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     let shadow_k = smooth(30.0 * zoom, 42.0 * zoom, ext_max);
                     if let (Some(sc), true) = (scene(), subject && shadow_k > 0.001) {
                         let _shadow = Fade::set(shadow_k);
-                        // a form in light throws a shadow: the same shape, moved away from the light, laid thinly and
-                        // coolly over whatever is there
+                        // a form in light throws a shadow onto what is behind it: the same shape, moved away from the
+                        // light, glazed over whatever is there in its own shadow colour (it used to be laid as dark
+                        // paint, half of what was under it, which read as near-black patches on the owl), crisp where
+                        // it leaves the form. It is a shallow shadow (the form stands close to what it falls on).
+                        let lt = sc.l.towards(centre);
                         let d = (ext_min * 0.2).min(26.0 * zoom);
-                        let cast: Vec<[f32; 2]> = pts.iter().map(|q| [q[0] - sc.light[0] * d, q[1] - sc.light[1] * d * 1.15]).collect();
-                        let under = flat_under(&p.flat, centre[0], centre[1], ext_min * 0.25, c);
-                        let dark = [under[0] * 0.5, under[1] * 0.55, under[2] * 0.68];
-                        paint_form(&mut p, &cast, dark, dark, 0.5, id ^ 0x5AD0, 1.1, 0.4, Tool::Flat, 0.0);
+                        let cast: Vec<[f32; 2]> = pts.iter().map(|q| [q[0] - lt[0] * d, q[1] - lt[1] * d * 1.15]).collect();
+                        paint_cast_shadow(&mut p, &cast, Some(&pts), 0.6, 0.15, id ^ 0x5AD0);
                     }
                     let (detail, body) = match scene() {
                         // brush and paint by attention as well: small and thick where the eye is, broad and thin elsewhere
@@ -2205,7 +2719,8 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                         detail,
                         body,
                         if subject { Tool::Filbert } else { Tool::Flat },
-                        if subject { 1.0 } else { 0.35 * (1.0 - smooth(800.0, 1000.0, ext_max / zoom)) },
+                        // (a plane of scenery is lit nearly evenly: only a hint of turning)
+                        if subject { 1.0 } else { 0.15 * (1.0 - smooth(800.0, 1000.0, ext_max / zoom)) },
                         rec.pickup_add,
                         rec.contour,
                     );
@@ -2306,7 +2821,10 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                 // (a rigger draws finer than the smallest brush paints an area)
                 paint_line(&mut p, &pts, false, rgb01(col), w.max(small_brush * 0.42), id ^ 0x4321, 1.0, None);
             }
-            Kind::Glow { .. } => {}
+            Kind::Glow { col, a } => {
+                let r = (pts[1][0] - pts[0][0]).hypot(pts[1][1] - pts[0][1]);
+                paint_glow(&mut p, pts[0], r, rgb01(col), a as f32, id ^ 0x6100);
+            }
         }
     }
     if std::env::var("OIL_DBG").is_ok() {
@@ -3951,6 +4469,100 @@ mod tests {
         let (gap, core) = (gap / n, core / n);
         assert!(core - sky > 0.15, "the strips themselves should be painted ({core:.3} against the sky's {sky:.3})");
         assert!((gap - sky).abs() < 0.35 * (core - sky), "the gaps filled in: {gap:.3}, sky {sky:.3}, strips {core:.3}");
+    }
+
+    /// A one-shot film under moonlight: a cloth in bands of colour, a post standing on it, and the post's shadow
+    /// across the bands (drawn as films draw shadows, a dark translucent shape), at `t` of its full strength; and a
+    /// moon with its glow, whose glow grows with `t`.
+    fn shadowed(r: &mut Rec, t: f64, _lt: f64) {
+        r.light(Lighting::MOONLIGHT.from_dir([0.75, -0.66]));
+        r.boil("ground");
+        r.paint("ground", &rect_pts(-60.0, -60.0, 2040.0, 1200.0), wash(rgb(0x5A6E4A)).no_ink());
+        r.boil("cloth");
+        for (i, c) in [0xD9663A, 0xE8B866, 0x3E6E9E, 0xF2EEDC].iter().enumerate() {
+            r.paint("band", &rect_pts(300.0 + i as f64 * 150.0, 200.0, 150.0, 700.0), wash(rgb(*c)).no_ink());
+        }
+        r.boil("post");
+        r.paint("post", &[[1000.0, 160.0], [1060.0, 160.0], [1070.0, 760.0], [990.0, 760.0]], wash(rgb(0x6B4A3A)));
+        r.boil("post.shadow");
+        r.paint("shadow", &[[1000.0, 760.0], [1070.0, 760.0], [420.0, 880.0], [300.0, 860.0]], wash(rgb(0x1D1A1F)).op(255.0 * t).no_ink().shadow_of("post"));
+        r.boil("sky");
+        r.paint("sky", &rect_pts(1300.0, -60.0, 700.0, 1200.0), wash(rgb(0x14204A)).no_ink());
+        r.glows("moon.glow", &[(1650.0, 400.0, 40.0 + 300.0 * t, rgb(0xBFD0FF), 0.4)]);
+        r.boil("moon");
+        r.paint("moon", &ell_pts(1650.0, 400.0, 90.0, 90.0, 32, 0.0), wash(rgb(0xF5F0DC)).no_ink().role(Role::Light));
+    }
+
+    #[test]
+    fn a_shadow_is_a_glaze_that_keeps_what_it_falls_on() {
+        // The owl's "very deep shadows": a shadow was painted as opaque dark paint (half of whatever was under it),
+        // a near-black patch whatever it fell on. A shadow is a glaze: each band it crosses stays its own colour,
+        // darker by a step, and the bands stay as different from each other as they were.
+        let film = Film::new("shadowed", 1.0, vec![Shot::new(0.0, "s", shadowed)], "/nonexistent/shadowed/film");
+        set_style(Style { cast: &["post"], ..Style::DEFAULT });
+        if test_gpu() {
+            set_backend(Backend::Gpu);
+        }
+        let lit = paint_frame_painting(&film, 0.0, 1);
+        let shaded = paint_frame_painting(&film, 1.0, 1);
+        // along the middle of the shadow
+        let mean = |p: &Painting, x0: usize| {
+            let yc = (760.0 + (1035.0 - (x0 as f32 + 10.0)) * 110.0 / 675.0) as usize;
+            let mut m = [0.0f32; 3];
+            for y in yc - 5..yc + 5 {
+                for x in x0..x0 + 20 {
+                    for k in 0..3 {
+                        m[k] += p.col[y * WI + x][k] / 200.0;
+                    }
+                }
+            }
+            m
+        };
+        let mut lums = vec![];
+        for i in 0..4 {
+            let x0 = 365 + i * 150;
+            let (a, b) = (mean(&lit, x0), mean(&shaded, x0));
+            let (la, lb) = (lum3(a), lum3(b));
+            assert!(lb < la * 0.9 && lb > la * 0.35, "band {i}: in shadow {lb:.3}, in light {la:.3}: a shadow is a step down, not black");
+            // its hue survives: the strongest channel in the light is still the strongest in shadow
+            let top = |c: [f32; 3]| (0..3).max_by(|&p, &q| c[p].total_cmp(&c[q])).unwrap();
+            assert!(la - lum3([a[0].min(a[1]).min(a[2]); 3]) < 0.05 || top(a) == top(b), "band {i}: its colour turned from {a:?} to {b:?}");
+            lums.push(lb);
+        }
+        let spread = lums.iter().cloned().fold(0.0f32, f32::max) - lums.iter().cloned().fold(1.0f32, f32::min);
+        assert!(spread > 0.15, "the bands ran together in shadow ({lums:?})");
+    }
+
+    #[test]
+    fn a_shadow_fading_in_and_a_glow_growing_never_pop() {
+        let film = Film::new("shadowed", 1.0, vec![Shot::new(0.0, "s", shadowed)], "/nonexistent/shadowed/film");
+        set_style(Style { cast: &["post"], ..Style::DEFAULT });
+        if test_gpu() {
+            set_backend(Backend::Gpu);
+        }
+        let n = 40;
+        let frames: Vec<Vec<[f32; 3]>> = (0..=n).map(|i| paint_frame_painting(&film, i as f64 / n as f64, 1).col).collect();
+        for (x0, x1, y0, y1, what) in [(280, 1080, 740, 900, "shadow"), (1300, 1920, 60, 740, "glow")] {
+            let steps: Vec<f32> = frames
+                .windows(2)
+                .map(|w| {
+                    let mut sum = 0.0f32;
+                    for y in (y0..y1).step_by(2) {
+                        for x in (x0..x1).step_by(2) {
+                            sum += (0..3).map(|k| (w[0][y * WI + x][k] - w[1][y * WI + x][k]).abs()).sum::<f32>();
+                        }
+                    }
+                    sum / ((y1 - y0) * (x1 - x0)) as f32
+                })
+                .collect();
+            if std::env::var("STEPS").is_ok() {
+                eprintln!("{what}: {:?}", steps.iter().map(|s| (s * 1e4).round() as i32).collect::<Vec<_>>());
+            }
+            for i in 2..steps.len() - 2 {
+                let around = (steps[i - 2] + steps[i - 1] + steps[i + 1] + steps[i + 2]) / 4.0;
+                assert!(steps[i] < 2.5 * around + 0.002, "the {what}: step {i} changed it {:.1}x as much as the steps around it", steps[i] / around.max(1e-6));
+            }
+        }
     }
 
     #[test]

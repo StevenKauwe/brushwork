@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use brushwork_kit::{Col, H, P, W};
 
+use crate::semantics::{Lighting, Role};
+
 /// The default outline colour (PAL.ink).
 pub const PAL_INK: Col = brushwork_kit::pal::INK;
 /// Pixels per unit of p5.brush stroke weight (measured on the original render: a weight-5 'ink' stroke at sw 38 is
@@ -44,10 +46,14 @@ pub struct Po {
     /// The watercolour layer's bleed, texture and border (p5.brush's fillBleed and fillTexture; the kit's defaults
     /// are 0.1, 0.4 and 0.35).
     pub wc: [f64; 3],
+    /// What the shape is, for the painter (see [`Role`]).
+    pub role: Role,
+    /// For a shadow: the family (boil key, matched as a prefix) of what casts it.
+    pub caster: Option<&'static str>,
 }
 impl Default for Po {
     fn default() -> Self {
-        Po { wash: None, wash_op: 255.0, fill: None, fill_op: 170.0, ink: Ink::Default, sw: 1.0, curv: 0.0, wc: WC }
+        Po { wash: None, wash_op: 255.0, fill: None, fill_op: 170.0, ink: Ink::Default, sw: 1.0, curv: 0.0, wc: WC, role: Role::Auto, caster: None }
     }
 }
 /// A flat colour shape with the default ink outline.
@@ -108,6 +114,19 @@ impl Po {
         self.curv = v;
         self
     }
+    /// Say what the shape is (see [`Role`]).
+    pub fn role(mut self, r: Role) -> Po {
+        self.role = r;
+        self
+    }
+    /// A cast shadow, and the family that casts it (a prefix of its boil key): the shape is a hint of where the
+    /// shadow falls, and the painter derives its colour from what it falls on and the scene's light, its softness
+    /// from how far it is from what casts it.
+    pub fn shadow_of(mut self, caster: &'static str) -> Po {
+        self.role = Role::Shadow;
+        self.caster = Some(caster);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +151,10 @@ pub struct Item {
     pub pts: Vec<P>,
     /// A shape's watercolour bleed, texture and border.
     pub wc: [f64; 3],
+    /// What it is, for the painter (glows are [`Role::Light`], lines [`Role::Line`], shapes as drawn).
+    pub role: Role,
+    /// For a shadow: the family that casts it.
+    pub caster: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -188,6 +211,9 @@ pub struct Rec {
     pub cam: Option<Cam>,
     pub last_cam: Option<Cam>,
     pub items: Vec<Item>,
+    /// The light the frame is seen in (see [`Rec::light`]), and whether its place is on the screen (not in the
+    /// camera's world).
+    pub lighting: Option<(Lighting, bool)>,
 }
 
 impl Rec {
@@ -209,6 +235,7 @@ impl Rec {
             cam: None,
             last_cam: None,
             items: vec![],
+            lighting: None,
         }
     }
     pub fn push(&mut self) {
@@ -282,7 +309,18 @@ impl Rec {
         let family = if o.wash.is_none() && o.fill.is_some() && o.ink == Ink::None { format!("{}@wc", self.key) } else { self.key.clone() };
         let id = self.ident(&family, tag);
         let pts = self.xform(pts);
-        self.items.push(Item { family, id, screen: !self.in_cam, kind, pts, wc: o.wc });
+        self.items.push(Item { family, id, screen: !self.in_cam, kind, pts, wc: o.wc, role: o.role, caster: o.caster });
+    }
+
+    /// The light this frame is seen in: where the key light is, its colour and strength, and the ambient light in
+    /// the shadows (see [`Lighting`]). A place (`Lighting::at`) is taken through the current transform, like a
+    /// shape's points (and, drawn inside the camera, through the camera). Without it the painter uses the film's
+    /// `Style`, or a plain light from the upper left.
+    pub fn light(&mut self, mut l: Lighting) {
+        if let Some(p) = l.key_at {
+            l.key_at = Some(self.m.apply(p));
+        }
+        self.lighting = Some((l, !self.in_cam));
     }
 
     /// An open ink line through the points (`curv` 0–1 smooths it). sw is the brush weight multiplier.
@@ -299,7 +337,7 @@ impl Rec {
         let family = self.key.clone();
         let id = self.ident(&family, tag);
         let pts = self.xform(pts);
-        self.items.push(Item { family, id, screen: !self.in_cam, kind: Kind::Line { col, width, curv }, pts, wc: WC });
+        self.items.push(Item { family, id, screen: !self.in_cam, kind: Kind::Line { col, width, curv }, pts, wc: WC, role: Role::Line, caster: None });
     }
 
     /// Additive halos: (x, y, r, colour, a). Light adds, so it shows on dark grounds and barely on light ones.
@@ -312,7 +350,16 @@ impl Rec {
             }
             let id = self.ident(&family, tag);
             let pts = self.xform(&[[x, y], [x + r, y]]);
-            self.items.push(Item { family: family.clone(), id, screen: !self.in_cam, kind: Kind::Glow { col, a: a.min(1.0) }, pts, wc: WC });
+            self.items.push(Item {
+                family: family.clone(),
+                id,
+                screen: !self.in_cam,
+                kind: Kind::Glow { col, a: a.min(1.0) },
+                pts,
+                wc: WC,
+                role: Role::Light,
+                caster: None,
+            });
         }
     }
     /// One additive halo.

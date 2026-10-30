@@ -74,6 +74,13 @@
     <span class="label">Next shape</span>
     <button id="subject" aria-pressed="true">Subject (casts a shadow)</button>
     <button id="outline" aria-pressed="true">Outline</button>
+    <button id="shadow" aria-pressed="false">Shadow (glaze)</button>
+    <button id="glow" aria-pressed="false">Glow (a light)</button>
+  </div>
+  <div class="row">
+    <span class="label">Light</span>
+    <button id="light">Light: Moonlight</button>
+    <button id="from">From the upper left</button>
   </div>
   <div class="row">
     <button id="undo">Undo</button>
@@ -81,8 +88,10 @@
     <button id="sample">Sample scene</button>
   </div>
   <footer>
-    Drag on the canvas to lay down a shape; shapes paint back to front. Subjects are modelled in light and get smaller
-    brushes and thicker paint. The painting runs on your device, in a Web Worker: on its graphics card where the browser
+    Drag on the canvas to lay down a shape; shapes paint back to front. Subjects are modelled in the light and get
+    smaller brushes and thicker paint. A shadow shape says where a shadow falls: the painter glazes it over what is
+    there, in a colour mixed from it and the light. A glow is a light: luminous paint with a glow round it, and the
+    scene's light comes from it. The painting runs on your device, in a Web Worker: on its graphics card where the browser
     offers WebGPU, otherwise on its processor (the label on the canvas says which).
     <a href="https://github.com/StevenKauwe/brushwork">Source on GitHub</a> (MIT).
   </footer>
