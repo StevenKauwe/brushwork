@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! tools/build-web.sh && cargo run -p webcheck -- [--dir dist | --url URL] [--browser webkit|chrome] [--phone] [--shot out.png]
+//!     [--webgpu] [--headed] [--no-draw] [--expect-backend gpu|cpu] [--compare]
 //! ```
 //!
 //! It serves `--dir` (default `dist`) on a local port, or opens `--url`, through WebDriver: `WebKitWebDriver` with
@@ -9,6 +10,13 @@
 //! `xvfb-run`), or `chromedriver` with Chromium. `--phone` opens it at an iPhone's size. It waits for the sample scene
 //! to finish painting (the canvas's `data-state` turns `painted`), checks the canvas holds a picture (many colours,
 //! not one), prints the paint time from `data-paint-ms`, and with `--shot` saves a screenshot.
+//!
+//! The backend: the page's small `#backend` label must be showing, say `GPU` or `CPU`, and agree with what painted
+//! the picture (`data-paint-backend`); `--expect-backend` also says which it must be. `--webgpu` starts Chromium with
+//! WebGPU switched on (on Linux it is off without flags), and `--headed` in a window (headless Chromium may offer only
+//! a software GPU, which the page declines); `WEBCHECK_CHROME_ARGS` adds switches. `--compare`, when the GPU painted, paints the sample scene
+//! again on the CPU (`?backend=cpu`) and checks the two agree within the engine's GPU tolerance ([`agree`]),
+//! printing both paint times.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -140,7 +148,7 @@ struct Browser {
 }
 
 impl Browser {
-    fn start(kind: &str, phone: bool) -> Result<Browser> {
+    fn start(kind: &str, phone: bool, webgpu: bool, headed: bool) -> Result<Browser> {
         let port = free_port()?;
         let (driver, caps) = match kind {
             "webkit" => {
@@ -161,10 +169,21 @@ impl Browser {
                 let driver = which(&["chromedriver"]).ok_or("chromedriver not found")?;
                 let bin = which(&["chromium", "chromium-browser", "google-chrome"]).ok_or("Chromium not found")?;
                 let size = if phone { "--window-size=390,844" } else { "--window-size=1280,900" };
-                let mut args = vec!["--headless=new".to_string(), size.to_string(), "--no-sandbox".to_string()];
+                // (`--headed` opens a real window: headless Chromium may only offer a software GPU)
+                let mut args = vec![size.to_string(), "--no-sandbox".to_string()];
+                if !headed {
+                    args.push("--headless=new".to_string());
+                }
                 if phone {
                     args.push(format!("--user-agent={IPHONE_UA}"));
                 }
+                if webgpu {
+                    // Linux Chromium keeps WebGPU off unless asked. (Not `--use-angle=vulkan`: with it the 2D canvas
+                    // reads back as one flat colour, on Wayland with an NVIDIA card at least.)
+                    args.push("--enable-unsafe-webgpu".to_string());
+                }
+                // more switches for this machine's Chromium (space-separated), e.g. to pick its GPU
+                args.extend(std::env::var("WEBCHECK_CHROME_ARGS").unwrap_or_default().split_whitespace().map(String::from));
                 (driver, json!({ "capabilities": { "alwaysMatch": { "browserName": "chrome", "goog:chromeOptions": { "binary": bin, "args": args } } } }))
             }
         };
@@ -187,6 +206,10 @@ impl Browser {
         if phone && kind == "webkit" {
             let _ = b.call("POST", "/window/rect", Some(json!({ "width": 390, "height": 844 })));
         }
+        if headed {
+            let (w, h) = if phone { (390, 844) } else { (1280, 900) };
+            let _ = b.call("POST", "/window/rect", Some(json!({ "width": w, "height": h })));
+        }
         Ok(b)
     }
 
@@ -204,6 +227,93 @@ impl Browser {
     fn js(&self, script: &str) -> Result<Value> {
         self.call("POST", "/execute/sync", Some(json!({ "script": script, "args": [] })))
     }
+
+    /// Open `url` and wait for the sample scene to be painted; prints the page's state as it changes.
+    fn painted(&self, url: &str) -> Result<()> {
+        self.call("POST", "/url", Some(json!({ "url": url })))?;
+        let t0 = Instant::now();
+        let mut last = String::new();
+        loop {
+            let state = self.js(
+                r#"const c = document.getElementById("canvas"); return c ? c.dataset.state + " | " + document.getElementById("status").textContent : "no canvas";"#,
+            )?;
+            let state = state.as_str().unwrap_or("").to_string();
+            if state != last {
+                println!("[{:5.1} s] {state}", t0.elapsed().as_secs_f64());
+                last = state.clone();
+            }
+            if state.starts_with("painted") {
+                return Ok(());
+            }
+            if state.contains("failed") || state.contains("Could not") {
+                return Err(format!("the page reports: {state}"));
+            }
+            if t0.elapsed() > Duration::from_secs(240) {
+                return Err(format!("no painting after 4 minutes (last: {state})"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Paint `n` more times with new seeds (the New seed button): each painting's own time, in seconds.
+    fn repaints(&self, n: usize) -> Result<Vec<f64>> {
+        let mut out = vec![];
+        for _ in 0..n {
+            self.js(r#"document.getElementById("canvas").dataset.state = "asked"; document.getElementById("reseed").click(); return true;"#)?;
+            let t0 = Instant::now();
+            loop {
+                let v = self.js(r#"const c = document.getElementById("canvas"); return [c.dataset.state, Number(c.dataset.paintMs || 0)];"#)?;
+                if v[0].as_str() == Some("painted") {
+                    out.push(v[1].as_f64().unwrap_or(0.0) / 1000.0);
+                    break;
+                }
+                if t0.elapsed() > Duration::from_secs(240) {
+                    return Err("a repaint never finished".into());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The canvas's RGBA pixels.
+    fn pixels(&self) -> Result<Vec<u8>> {
+        let b64 = self.js(r#"const c = document.getElementById("canvas"); const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+               let s = ""; for (let i = 0; i < d.length; i += 32768) s += String.fromCharCode.apply(null, d.subarray(i, i + 32768)); return btoa(s);"#)?;
+        base64::engine::general_purpose::STANDARD.decode(b64.as_str().unwrap_or("")).map_err(|e| e.to_string())
+    }
+
+    /// The backend label (`data-kind`, its text, whether it shows) and what painted the picture; prints why.
+    fn backend(&self) -> Result<(String, String, bool, String)> {
+        if let Some(why) = self.js(r#"const l = document.getElementById("backend"); return l ? l.title : "";"#)?.as_str() {
+            println!("backend: {why}");
+        }
+        let v = self.js(
+            r#"const l = document.getElementById("backend"), c = document.getElementById("canvas");
+               return l ? [l.dataset.kind || "", l.textContent, !l.hidden && l.getBoundingClientRect().width > 0, c.dataset.paintBackend || ""] : ["", "", false, ""];"#,
+        )?;
+        let s = |i: usize| v[i].as_str().unwrap_or("").to_string();
+        Ok((s(0), s(1), v[2].as_bool().unwrap_or(false), s(3)))
+    }
+}
+
+/// Whether a GPU painting and a CPU one agree within the engine's GPU tolerance (README, "CPU and GPU"): the GPU's
+/// own `sin`, `exp` and division move a handful of values by a few levels, and very rarely a pixel right at a
+/// threshold falls the other way. At most 0.01 % of the colour values may differ at all, and at most 0.001 % by more
+/// than 5 levels out of 255. Returns (differing, by more than 5, largest difference, values compared).
+fn agree(a: &[u8], b: &[u8]) -> (usize, usize, u8, usize) {
+    let mut n = (0, 0, 0u8, 0);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        if i % 4 == 3 {
+            continue; // alpha: always opaque
+        }
+        let d = x.abs_diff(*y);
+        n.0 += (d > 0) as usize;
+        n.1 += (d > 5) as usize;
+        n.2 = n.2.max(d);
+        n.3 += 1;
+    }
+    n
 }
 
 impl Drop for Browser {
@@ -225,30 +335,23 @@ fn run() -> Result<()> {
             format!("http://127.0.0.1:{}/", serve(dir)?)
         }
     };
-    let b = Browser::start(&kind, phone)?;
-    b.call("POST", "/url", Some(json!({ "url": url })))?;
-    let t0 = Instant::now();
-    let mut last = String::new();
-    loop {
-        let state = b.js(
-            r#"const c = document.getElementById("canvas"); return c ? c.dataset.state + " | " + document.getElementById("status").textContent : "no canvas";"#,
-        )?;
-        let state = state.as_str().unwrap_or("").to_string();
-        if state != last {
-            println!("[{:5.1} s] {state}", t0.elapsed().as_secs_f64());
-            last = state.clone();
-        }
-        if state.starts_with("painted") {
-            break;
-        }
-        if state.contains("failed") || state.contains("Could not") {
-            return Err(format!("the page reports: {state}"));
-        }
-        if t0.elapsed() > Duration::from_secs(240) {
-            return Err(format!("no painting after 4 minutes (last: {state})"));
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    let webgpu = args.iter().any(|a| a == "--webgpu");
+    let b = Browser::start(&kind, phone, webgpu, args.iter().any(|a| a == "--headed"))?;
+    b.painted(&url)?;
+    let (found, label, shown, painted_by) = b.backend()?;
+    println!("backend label: {label:?} (worker found {found:?}; the picture was painted on {painted_by:?})");
+    if !shown || !["GPU", "CPU"].contains(&label.as_str()) {
+        return Err(format!("the backend label isn't showing GPU or CPU (text {label:?}, showing {shown})"));
     }
+    if label.to_lowercase() != painted_by {
+        return Err(format!("the label says {label} but the picture was painted on {painted_by}"));
+    }
+    if let Some(want) = opt("--expect-backend")
+        && want != painted_by
+    {
+        return Err(format!("expected the {want} backend, the page painted on {painted_by}"));
+    }
+    let sample = if args.iter().any(|a| a == "--compare") && painted_by == "gpu" { Some(b.pixels()?) } else { None };
     // a painting has many colours; the flat shapes it started from have only a dozen
     let colours = b.js(r#"const c = document.getElementById("canvas"); const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
            const seen = new Set(); for (let i = 0; i < d.length; i += 4 * 7) seen.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]);
@@ -272,46 +375,87 @@ fn run() -> Result<()> {
     if scroll > inner + 1 {
         return Err(format!("the page scrolls sideways ({scroll} px in a {inner} px window)"));
     }
-    // draw a shape: press on the canvas, go round a circle, let go; then Paint, and wait for the new painting
-    let canvas = b.call("POST", "/element", Some(json!({ "using": "css selector", "value": "#canvas" })))?;
-    let id = canvas.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str()).ok_or("no canvas element")?.to_string();
-    let rect = b.js(r#"const r = document.getElementById("canvas").getBoundingClientRect(); return [r.width, r.height];"#)?;
-    let (cw, ch) = (rect[0].as_f64().unwrap_or(300.0), rect[1].as_f64().unwrap_or(170.0));
-    let mut moves =
-        vec![json!({ "type": "pointerMove", "duration": 0, "origin": { "element-6066-11e4-a52e-4f735466cecf": id }, "x": (cw * 0.25) as i64, "y": 0 })];
-    moves.push(json!({ "type": "pointerDown", "button": 0 }));
-    for k in 1..=24 {
-        let a = k as f64 / 24.0 * std::f64::consts::TAU;
-        moves.push(json!({ "type": "pointerMove", "duration": 10, "origin": { "element-6066-11e4-a52e-4f735466cecf": id }, "x": (cw * 0.25 * a.cos()) as i64, "y": (ch * 0.25 * a.sin()) as i64 }));
-    }
-    moves.push(json!({ "type": "pointerUp", "button": 0 }));
-    b.call(
-        "POST",
-        "/actions",
-        Some(json!({ "actions": [{ "type": "pointer", "id": "finger", "parameters": { "pointerType": "mouse" }, "actions": moves }] })),
-    )?;
-    let drawn = b.js(r#"return document.getElementById("canvas").dataset.state;"#)?;
-    if drawn.as_str() != Some("flat") {
-        return Err(format!("drawing a shape didn't put the page back to its shapes (state {drawn})"));
-    }
-    b.js(r#"document.getElementById("paint").click(); return true;"#)?;
-    let t1 = Instant::now();
-    loop {
-        let state = b.js(r#"return document.getElementById("canvas").dataset.state;"#)?;
-        if state.as_str() == Some("painted") {
-            break;
+    // (`--no-draw` skips this: a headed window that the desktop tiles and scales can put the pointer off target)
+    if !args.iter().any(|a| a == "--no-draw") {
+        // draw a shape: press on the canvas, go round a circle, let go; then Paint, and wait for the new painting
+        let canvas = b.call("POST", "/element", Some(json!({ "using": "css selector", "value": "#canvas" })))?;
+        let id = canvas.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_str()).ok_or("no canvas element")?.to_string();
+        let rect = b.js(r#"const c = document.getElementById("canvas"); c.scrollIntoView({ block: "center" }); const r = c.getBoundingClientRect(); return [r.width, r.height];"#)?;
+        let (cw, ch) = (rect[0].as_f64().unwrap_or(300.0), rect[1].as_f64().unwrap_or(170.0));
+        let mut moves =
+            vec![json!({ "type": "pointerMove", "duration": 0, "origin": { "element-6066-11e4-a52e-4f735466cecf": id }, "x": (cw * 0.25) as i64, "y": 0 })];
+        moves.push(json!({ "type": "pointerDown", "button": 0 }));
+        for k in 1..=24 {
+            let a = k as f64 / 24.0 * std::f64::consts::TAU;
+            moves.push(json!({ "type": "pointerMove", "duration": 10, "origin": { "element-6066-11e4-a52e-4f735466cecf": id }, "x": (cw * 0.25 * a.cos()) as i64, "y": (ch * 0.25 * a.sin()) as i64 }));
         }
-        if t1.elapsed() > Duration::from_secs(240) {
-            return Err(format!("the drawn shape never got painted (state {state})"));
+        moves.push(json!({ "type": "pointerUp", "button": 0 }));
+        b.call(
+            "POST",
+            "/actions",
+            Some(json!({ "actions": [{ "type": "pointer", "id": "finger", "parameters": { "pointerType": "mouse" }, "actions": moves }] })),
+        )?;
+        let drawn = b.js(r#"return document.getElementById("canvas").dataset.state;"#)?;
+        if drawn.as_str() != Some("flat") {
+            return Err(format!("drawing a shape didn't put the page back to its shapes (state {drawn})"));
         }
-        std::thread::sleep(Duration::from_millis(250));
+        b.js(r#"document.getElementById("paint").click(); return true;"#)?;
+        let t1 = Instant::now();
+        loop {
+            let state = b.js(r#"return document.getElementById("canvas").dataset.state;"#)?;
+            if state.as_str() == Some("painted") {
+                break;
+            }
+            if t1.elapsed() > Duration::from_secs(240) {
+                return Err(format!("the drawn shape never got painted (state {state})"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let again = b.js(r#"const c = document.getElementById("canvas"); return [Number(c.dataset.paintMs || 0), c.dataset.paintBackend || ""];"#)?;
+        println!(
+            "drew a shape and painted it again in {:.1} s (the painting itself {:.2} s, on the {})",
+            t1.elapsed().as_secs_f64(),
+            again[0].as_f64().unwrap_or(0.0) / 1000.0,
+            again[1].as_str().unwrap_or("?")
+        );
     }
-    println!("drew a shape and painted it again in {:.1} s", t1.elapsed().as_secs_f64());
     if let Some(path) = opt("--shot") {
         let png = b.call("GET", "/screenshot", None)?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(png.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
         std::fs::write(&path, bytes).map_err(|e| format!("{path}: {e}"))?;
         println!("screenshot: {path}");
+    }
+    if args.iter().any(|a| a == "--compare") {
+        let Some(gpu) = sample else {
+            println!("compare: the GPU didn't paint, nothing to compare");
+            return Ok(());
+        };
+        let gpu_ms = ms;
+        let gpu_warm = b.repaints(3)?;
+        let sep = if url.contains('?') { '&' } else { '?' };
+        b.painted(&format!("{url}{sep}backend=cpu"))?;
+        let (_, label, _, painted_by) = b.backend()?;
+        if painted_by != "cpu" || label != "CPU" {
+            return Err(format!("?backend=cpu painted on {painted_by} with the label {label:?}"));
+        }
+        let cpu = b.pixels()?;
+        let cpu_ms = b.js(r#"return Number(document.getElementById("canvas").dataset.paintMs || 0);"#)?.as_f64().unwrap_or(0.0);
+        let cpu_warm = b.repaints(3)?;
+        println!("warm repaints (new seeds): GPU {gpu_warm:.2?} s, CPU {cpu_warm:.2?} s");
+        if cpu.len() != gpu.len() {
+            return Err(format!("the paintings differ in size ({} and {} bytes)", gpu.len(), cpu.len()));
+        }
+        let (diff, big, max, total) = agree(&gpu, &cpu);
+        println!(
+            "compare: GPU {:.2} s, CPU {:.2} s ({:.1}x); {diff} of {total} colour values differ ({:.4} %), {big} by more than 5 levels, largest {max}",
+            gpu_ms / 1000.0,
+            cpu_ms / 1000.0,
+            cpu_ms / gpu_ms.max(1.0),
+            diff as f64 * 100.0 / total as f64
+        );
+        if diff * 10_000 > total || big * 100_000 > total {
+            return Err("the GPU and CPU paintings disagree beyond the engine's tolerance".into());
+        }
     }
     Ok(())
 }

@@ -12,7 +12,8 @@
 //! by a pixel changes the painting by a pixel's worth. The tests at the bottom hold the engine to that.
 //!
 //! Backends: the CPU is the reference; with the `gpu` feature and `OIL_BACKEND=gpu` (or [`set_backend`]) the same
-//! strokes are laid by the GPU (wgpu), see `gpu.rs`.
+//! strokes are laid by the GPU (wgpu), see `gpu.rs`. In a browser (WebGPU) open it with [`open_gpu`] and paint with
+//! [`paint_frame_async`], since nothing there may block waiting for the GPU.
 
 // Per-channel and per-band loops index several arrays with the same counter and mirror the GPU kernel line for
 // line (strokes.wgsl); the painting functions take a painter's many knobs as plain arguments on purpose.
@@ -1841,6 +1842,37 @@ pub const HEIGHT: usize = HI;
 
 /// One frame of the film, painted (before the relief is lit).
 fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
+    // (in a browser the GPU can only be waited for with `await`: there the GPU paints through `paint_frame_async`)
+    let mut p = plan_frame(film, t, seed, backend() == Backend::Gpu && cfg!(not(target_arch = "wasm32")));
+    finish(&mut p);
+    p
+}
+
+/// Open the GPU (or a new one, if the last was lost), for [`set_backend`]`(Backend::Gpu)`: what the adapter calls
+/// itself (a browser often keeps that private, so it may be empty), or why there is no usable GPU. Natively the
+/// first GPU frame opens it by itself; in a browser, await this first (and paint with [`paint_frame_async`]).
+#[cfg(feature = "gpu")]
+pub async fn open_gpu() -> Result<String, String> {
+    gpu::open().await
+}
+
+/// [`paint_frame`] that waits for the GPU with `await` instead of blocking, as a browser requires: on the GPU
+/// backend (opened with [`open_gpu`]) the strokes are planned here and laid by the GPU; on the CPU backend this is
+/// `paint_frame`. An error if the GPU is lost or rejects the work (paint the frame on the CPU instead).
+#[cfg(feature = "gpu")]
+pub async fn paint_frame_async(film: &Film, t: f64, seed: u32) -> Result<Vec<u8>, String> {
+    let mut p = plan_frame(film, t, seed, backend() == Backend::Gpu);
+    if let Some(r) = p.rec.take() {
+        let (col, thick) = gpu::render_async(&r).await?;
+        p.col = col;
+        p.thick = thick;
+    }
+    Ok(p.lit())
+}
+
+/// Plan and paint a frame's strokes; with `record`, the strokes are written down for the GPU instead of laid
+/// (`finish` lays them).
+fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
     DEPTH.store(std::env::var("OIL_DEPTH").is_ok(), Ordering::Relaxed);
     let rec = film.record(film.shot_at(t), t);
     // test hook: OIL_ZOOM multiplies the camera's zoom (to check that brushwork scales with it and is not re-planned)
@@ -1851,7 +1883,7 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
     let mut p = Painting::new();
     // GPU: everything is planned here as usual, and the strokes are laid on the GPU at the end. (Watercolour,
     // mixed media and bite holes paint the canvas directly here, so those frames stay on the CPU.)
-    if backend() == Backend::Gpu && !WATER.load(Ordering::Relaxed) && !MIXED.load(Ordering::Relaxed) && style().leaf_tags.is_empty() {
+    if record && !WATER.load(Ordering::Relaxed) && !MIXED.load(Ordering::Relaxed) && style().leaf_tags.is_empty() {
         p.rec = Some(Box::new(gpu::Recorder::new(p.col.clone())));
     }
     p.view = cam.map_or(1.0, |c| c.zoom as f32).clamp(0.25, 6.0);
@@ -2280,7 +2312,6 @@ fn paint_frame_painting(film: &Film, t: f64, seed: u32) -> Painting {
     if std::env::var("OIL_DBG").is_ok() {
         eprintln!("t {t:.3} zoom {:.3} strokes {}", cam.map_or(1.0, |c| c.zoom), p.strokes);
     }
-    finish(&mut p);
     p
 }
 
@@ -2302,7 +2333,7 @@ fn timing() -> bool {
 /// Lay whatever strokes a painting has written down for the GPU (no-op on the CPU backend).
 fn finish(p: &mut Painting) {
     if let Some(r) = p.rec.take() {
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
         {
             let t0 = timing().then(std::time::Instant::now);
             let (col, thick) = gpu::render(&r);
@@ -2312,10 +2343,10 @@ fn finish(p: &mut Painting) {
             p.col = col;
             p.thick = thick;
         }
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(all(feature = "gpu", not(target_arch = "wasm32"))))]
         {
             let _ = r;
-            unreachable!("recording strokes needs the `gpu` feature");
+            unreachable!("strokes recorded for the GPU are laid by `paint_frame_async` in a browser (and need the `gpu` feature)");
         }
     }
 }
@@ -3501,6 +3532,46 @@ mod tests {
     fn done(mut p: Painting) -> Painting {
         finish(&mut p);
         p
+    }
+
+    fn dusk(r: &mut Rec, _t: f64, _lt: f64) {
+        r.boil("sky");
+        r.paint("sky", &rect_pts(-40.0, -40.0, 2000.0, 700.0), wash(rgb(0x22325F)).no_ink());
+        r.boil("hill");
+        r.paint("hill", &[[-40.0, 760.0], [600.0, 640.0], [1300.0, 720.0], [1960.0, 650.0], [1960.0, 1120.0], [-40.0, 1120.0]], wash(rgb(0x3E4A6E)).no_ink());
+        r.boil("moon");
+        r.paint("moon", &ell_pts(1480.0, 300.0, 130.0, 130.0, 32, 0.0), wash(rgb(0xF2EEDC)).no_ink());
+        r.boil("owl");
+        r.paint("owl", &ell_pts(760.0, 520.0, 120.0, 150.0, 28, 0.0), wash(rgb(0xB5652F)));
+        r.paint("owl", &ell_pts(760.0, 560.0, 72.0, 100.0, 24, 0.0), wash(rgb(0xE8D2A8)).no_ink());
+    }
+
+    #[test]
+    fn the_gpu_paints_what_the_cpu_paints() {
+        // With `OIL_TEST_BACKEND=gpu`: a whole frame laid on the GPU agrees with the CPU's to the engine's GPU
+        // tolerance (README, "CPU and GPU"): the GPU's own sin, exp and division move a handful of values by a few
+        // levels, and very rarely a pixel right at a threshold falls the other way. At most 0.01 % of the 8-bit
+        // values may differ at all, and at most 0.001 % by more than 5. (The canvas page's webcheck --compare holds
+        // the browser's WebGPU to the same.)
+        if !test_gpu() {
+            return;
+        }
+        let film = Film::new("dusk", 1.0, vec![Shot::new(0.0, "dusk", dusk)], "/nonexistent/dusk/film");
+        set_style(Style { cast: &["owl"], ..Style::DEFAULT });
+        let cpu = plan_frame(&film, 0.0, 1, false).lit();
+        let mut gpu = plan_frame(&film, 0.0, 1, true);
+        assert!(gpu.rec.is_some(), "the frame was not recorded for the GPU");
+        finish(&mut gpu);
+        let gpu = gpu.lit();
+        let (mut diff, mut big, mut max) = (0usize, 0usize, 0u8);
+        for (a, b) in cpu.iter().zip(&gpu) {
+            let d = a.abs_diff(*b);
+            diff += (d > 0) as usize;
+            big += (d > 5) as usize;
+            max = max.max(d);
+        }
+        eprintln!("GPU vs CPU: {diff} of {} values differ, {big} by more than 5 levels, largest {max}", cpu.len());
+        assert!(diff * 10_000 <= cpu.len() && big * 100_000 <= cpu.len(), "{diff} values differ, {big} by more than 5 levels");
     }
     fn band(z: f32, dy: f32) -> Vec<[f32; 2]> {
         // the sky band of the frame that flickered (sky.b#1 at t = 19.125 s): very wide, its top edge on screen,

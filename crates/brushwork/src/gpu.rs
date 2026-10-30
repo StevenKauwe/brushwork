@@ -11,6 +11,13 @@
 //! What can differ: the GPU's `sin`, `exp`, `pow` and division are not bit-for-bit the CPU library's, so a pixel can
 //! differ in the last bits, and very rarely a pixel right at a threshold (the edge of a bristle, the end of a stroke)
 //! falls the other way. The CPU engine stays the reference; the tests run on the GPU with `OIL_TEST_BACKEND=gpu`.
+//!
+//! Waiting for the GPU: opening the device and reading the canvas back are `async` (`open`, `render_async`), with one
+//! copy of the work for both platforms. Natively the device is polled until the work is done, so the future is ready
+//! the first time it is polled and `render` is just `pollster::block_on` of it. In a browser nothing may block (the
+//! mapping only completes when the browser's event loop runs), so the canvas page awaits it in its Web Worker; the
+//! browser's own WebGPU is then the driver, and a lost device or rejected work comes back as an error (the page
+//! paints that frame on the CPU) instead of a panic.
 
 // Without the `gpu` feature nothing records strokes (the backend can't be chosen), so the recorder's fields go unread.
 #![cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -176,13 +183,19 @@ pub(crate) fn bin(r: &Recorder) -> (Vec<u32>, Vec<u32>) {
     (offsets, entries)
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub(crate) use backend::render;
+#[cfg(feature = "gpu")]
+pub(crate) use backend::{open, render_async};
 
 #[cfg(feature = "gpu")]
 mod backend {
     use super::*;
-    use std::sync::OnceLock;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
     use wgpu::util::DeviceExt;
 
     struct Gpu {
@@ -191,21 +204,41 @@ mod backend {
         pipeline: wgpu::ComputePipeline,
         layout: wgpu::BindGroupLayout,
         /// the toned ground, uploaded once (every GPU frame starts from the same one), with a hash to check it
-        ground: std::sync::Mutex<Option<(u64, std::sync::Arc<wgpu::Buffer>)>>,
+        ground: Mutex<Option<(u64, Arc<wgpu::Buffer>)>>,
+        /// set by wgpu when the device goes away (a driver reset, the browser reclaiming it): the next `open`
+        /// makes a new one
+        lost: Arc<AtomicBool>,
+        /// what the adapter calls itself (often empty in a browser, which keeps it private)
+        name: String,
     }
 
-    fn gpu() -> &'static Gpu {
-        static G: OnceLock<Gpu> = OnceLock::new();
-        G.get_or_init(|| {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-            let adapter = pollster::block_on(
-                instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
-            )
-            .expect("oil painter: no GPU adapter");
+    /// The device every frame uses, made by the first `open` (natively also by the first frame).
+    static GPU: Mutex<Option<Arc<Gpu>>> = Mutex::new(None);
+
+    impl Gpu {
+        async fn new() -> Result<Gpu, String> {
+            #[cfg(not(target_arch = "wasm32"))]
+            let desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+            #[cfg(target_arch = "wasm32")]
+            let desc = wgpu::InstanceDescriptor { backends: wgpu::Backends::BROWSER_WEBGPU, ..wgpu::InstanceDescriptor::new_without_display_handle() };
+            let instance = wgpu::Instance::new(desc);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
+                .await
+                .map_err(|e| if cfg!(target_arch = "wasm32") { "the browser offers no WebGPU adapter".to_string() } else { format!("no GPU adapter ({e})") })?;
+            let info = adapter.get_info();
+            // A browser's software stand-in (SwiftShader and the like) is slower than the CPU engine in its worker.
+            if cfg!(target_arch = "wasm32") && info.device_type == wgpu::DeviceType::Cpu {
+                return Err("the browser offers only a software GPU".into());
+            }
             let limits = adapter.limits();
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("oil"), required_limits: limits, ..Default::default() }))
-                    .expect("oil painter: no GPU device");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor { label: Some("oil"), required_limits: limits, ..Default::default() })
+                .await
+                .map_err(|e| format!("no GPU device ({e})"))?;
+            let lost = Arc::new(AtomicBool::new(false));
+            let flag = lost.clone();
+            device.set_device_lost_callback(move |_, _| flag.store(true, Ordering::Relaxed));
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("oil strokes"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("strokes.wgsl").into()),
@@ -230,16 +263,76 @@ mod backend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-            Gpu { device, queue, pipeline, layout, ground: std::sync::Mutex::new(None) }
-        })
+            Ok(Gpu { device, queue, pipeline, layout, ground: Mutex::new(None), lost, name: info.name })
+        }
     }
 
-    /// Lay the recorded strokes on the GPU: returns the canvas colour and paint thickness.
+    fn current() -> Option<Arc<Gpu>> {
+        GPU.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|g| !g.lost.load(Ordering::Relaxed))
+    }
+
+    /// Make the GPU device ready (again, if the last one was lost): what the adapter calls itself, or why there is
+    /// none. In a browser this is the only way to get one, as nothing there may wait for the GPU without `await`.
+    pub(crate) async fn open() -> Result<String, String> {
+        if let Some(g) = current() {
+            return Ok(g.name.clone());
+        }
+        let g = Arc::new(Gpu::new().await?);
+        let name = g.name.clone();
+        *GPU.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
+        Ok(name)
+    }
+
+    /// A value a wgpu callback hands over later, as a future (no executor of its own: whoever awaits drives it).
+    struct Later<T>(Arc<Mutex<(Option<T>, Option<Waker>)>>);
+    fn later<T: Send + 'static>() -> (impl FnOnce(T) + Send + 'static, Later<T>) {
+        let slot = Arc::new(Mutex::new((None, None::<Waker>)));
+        let tx = slot.clone();
+        let send = move |v: T| {
+            let mut s = tx.lock().unwrap_or_else(|e| e.into_inner());
+            s.0 = Some(v);
+            if let Some(w) = s.1.take() {
+                w.wake();
+            }
+        };
+        (send, Later(slot))
+    }
+    impl<T> Future for Later<T> {
+        type Output = T;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+            let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            match s.0.take() {
+                Some(v) => Poll::Ready(v),
+                None => {
+                    s.1 = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    /// Lay the recorded strokes on the GPU, blocking until they are read back (native only): the canvas colour
+    /// and paint thickness. The same work as [`render_async`], which a browser has to use.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn render(r: &Recorder) -> (Vec<[f32; 3]>, Vec<f32>) {
-        let g = gpu();
-        let t0 = std::time::Instant::now();
+        pollster::block_on(render_async(r)).unwrap_or_else(|e| panic!("oil painter: {e}"))
+    }
+
+    /// Lay the recorded strokes on the GPU and read them back: the canvas colour and paint thickness. Nothing in
+    /// here blocks in a browser: the readback completes when the browser resolves the mapping and wakes the
+    /// awaiting task. Natively the device is polled until the work is done, so the future is ready when first
+    /// polled. An error if the device is lost or rejects the work.
+    pub(crate) async fn render_async(r: &Recorder) -> Result<(Vec<[f32; 3]>, Vec<f32>), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if current().is_none() {
+            open().await?;
+        }
+        let g = current().ok_or("the GPU has not been opened, or was lost")?;
+        // (no clock unless asked for: there is none on wasm32-unknown-unknown)
+        let t0 = super::super::timing().then(std::time::Instant::now);
+        let since = |t: Option<std::time::Instant>| t.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let (offsets, entries) = bin(r);
-        let t_bin = t0.elapsed().as_secs_f64();
+        let t_bin = since(t0);
         let n = super::super::WI * super::super::HI;
         // the ground: the same for every frame, so it lives on the GPU and is copied into each frame's canvas
         let key = r.ground.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, c| c.iter().fold(h, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3)));
@@ -249,7 +342,7 @@ mod backend {
                 Some((k, b)) if *k == key => b.clone(),
                 _ => {
                     let col0: Vec<f32> = r.ground.iter().flat_map(|c| c.iter().copied()).collect();
-                    let b = std::sync::Arc::new(g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    let b = Arc::new(g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("ground"),
                         contents: bytemuck::cast_slice(&col0),
                         usage: wgpu::BufferUsages::COPY_SRC,
@@ -259,6 +352,8 @@ mod backend {
                 }
             }
         };
+        let scope_mem = g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let scope_valid = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let nonempty = |v: &[f32]| if v.is_empty() { vec![0.0f32] } else { v.to_vec() };
         let cmds: &[Cmd] = if r.cmds.is_empty() { &[Cmd { kind: 2, ..Default::default() }] } else { &r.cmds };
         let mk = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
@@ -308,17 +403,30 @@ mod backend {
         }
         enc.copy_buffer_to_buffer(&b_col, 0, &r_col, 0, (n * 12) as u64);
         enc.copy_buffer_to_buffer(&b_thick, 0, &r_thick, 0, (n * 4) as u64);
-        let t_up = t0.elapsed().as_secs_f64();
+        let t_up = since(t0);
         g.queue.submit([enc.finish()]);
         let (sc, st) = (r_col.slice(..), r_thick.slice(..));
-        sc.map_async(wgpu::MapMode::Read, |_| {});
-        st.map_async(wgpu::MapMode::Read, |_| {});
-        g.device.poll(wgpu::PollType::wait_indefinitely()).expect("oil painter: GPU poll");
-        let t_gpu = t0.elapsed().as_secs_f64();
-        let col: Vec<[f32; 3]> = bytemuck::cast_slice::<u8, f32>(&sc.get_mapped_range().expect("oil painter: map colour")).as_chunks::<3>().0.to_vec();
-        let thick: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&st.get_mapped_range().expect("oil painter: map thickness")).to_vec();
-        if super::super::timing() {
-            let t_all = t0.elapsed().as_secs_f64();
+        let (tx_col, rx_col) = later();
+        let (tx_thick, rx_thick) = later();
+        sc.map_async(wgpu::MapMode::Read, tx_col);
+        st.map_async(wgpu::MapMode::Read, tx_thick);
+        // Natively the work is driven here and the mapping callbacks fire inside this call; a browser does that
+        // itself, between turns of its event loop, while the awaits below hand control back to it.
+        #[cfg(not(target_arch = "wasm32"))]
+        g.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
+        let (valid, mem) = (scope_valid.pop(), scope_mem.pop());
+        let (valid, mem) = (valid.await, mem.await);
+        if let Some(e) = valid.or(mem) {
+            return Err(format!("the GPU rejected the strokes: {e}"));
+        }
+        rx_col.await.map_err(|e| format!("reading the colour back: {e}"))?;
+        rx_thick.await.map_err(|e| format!("reading the thickness back: {e}"))?;
+        let t_gpu = since(t0);
+        let col: Vec<[f32; 3]> =
+            bytemuck::cast_slice::<u8, f32>(&sc.get_mapped_range().map_err(|e| format!("mapping the colour: {e}"))?).as_chunks::<3>().0.to_vec();
+        let thick: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&st.get_mapped_range().map_err(|e| format!("mapping the thickness: {e}"))?).to_vec();
+        if t0.is_some() {
+            let t_all = since(t0);
             eprintln!(
                 "TIMING render bin {:.3} upload {:.3} gpu+wait {:.3} readback {:.3} ({} tile entries)",
                 t_bin,
@@ -328,6 +436,6 @@ mod backend {
                 entries.len()
             );
         }
-        (col, thick)
+        Ok((col, thick))
     }
 }
