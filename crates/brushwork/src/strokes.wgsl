@@ -115,12 +115,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
             let gy = f32(y) + 0.5 - s.cy;
             let gu = gx * s.cs + gy * s.sn;
             let gv = -gx * s.sn + gy * s.cs;
+            let tex = max(th, 0.0) / (max(th, 0.0) + 0.12);
             if (s.tool == 1u) {
-                let g = m * (0.72 + 0.28 * noise(gu / (60.0 * s.z), gv / (16.0 * s.z), s.id));
-                c0 = c0 + (vec3<f32>(s.col_r, s.col_g, s.col_b) - c0) * g;
-            } else {
-                let g = m * (0.74 + 0.16 * noise(gu / (90.0 * s.z), gv / (28.0 * s.z), s.id ^ 5u) + 0.1 * noise(gu / (16.0 * s.z), gv / (3.4 * s.z), s.id));
-                if (s.tool == 2u) {
+                // light falling on the paint (light_on in lib.rs)
+                let g = clamp(s.opacity * m * (0.45 + 1.1 * tex), 0.0, 1.0);
+                let inner = vec3<f32>(s.col_r, s.col_g, s.col_b);
+                let outer = vec3<f32>(s.alt_r, s.alt_g, s.alt_b);
+                c0 = c0 + (outer + (inner - outer) * m - c0) * g;
+            } else if (s.tool == 2u) {
+                let g = m * (0.82 + 0.25 * tex);
+                {
                     // a shadow: the paint here taken down by its own shadow colour (shade_paint in lib.rs)
                     let lw = vec3<f32>(0.3, 0.59, 0.11);
                     let v = dot(c0, lw);
@@ -128,9 +132,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
                     let l = max(dot(mm, lw), 1e-4);
                     let sh = clamp(mm * (v * (1.0 - s.along) / l), vec3<f32>(0.0), vec3<f32>(1.0));
                     c0 = c0 + (sh - c0) * g;
-                } else {
-                    c0 = c0 * (vec3<f32>(1.0) - g * (vec3<f32>(1.0) - vec3<f32>(s.col_r, s.col_g, s.col_b)));
                 }
+            } else {
+                let g = m * (0.74 + 0.16 * noise(gu / (90.0 * s.z), gv / (28.0 * s.z), s.id ^ 5u) + 0.1 * noise(gu / (16.0 * s.z), gv / (3.4 * s.z), s.id));
+                c0 = c0 * (vec3<f32>(1.0) - g * (vec3<f32>(1.0) - vec3<f32>(s.col_r, s.col_g, s.col_b)));
             }
             continue;
         }

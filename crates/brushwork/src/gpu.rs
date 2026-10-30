@@ -74,7 +74,7 @@ pub(crate) struct Cmd {
     pub y1: i32,
     /// 0 stroke, 1 glaze (col = the glaze colour, opacity = its strength), 2 a shape's glaze (col = the factors
     /// the paint below is multiplied by, under the mask handed over; cx, cy, sn, cs, z, id: its brushed grain) or,
-    /// with tool = 1, a scumble (col = the light paint dragged over it), or with tool = 2 a shadow (col = the shadow
+    /// with tool = 1, light falling on it (col near the light, alt at its reach, opacity at most), or with tool = 2 a shadow (col = the shadow
     /// colour, bend = how much of it is worked in, along = the value step)
     pub kind: u32,
     pub _pad: [u32; 15],
@@ -154,10 +154,11 @@ impl Recorder {
     }
     /// A glaze over the mask handed over last (`use_mask`): the paint below multiplied by `tint` where the mask
     /// covers it, with a faint brushed grain along `dir` (sin, cos) from `anchor`.
-    /// `mode` 0 a glaze (`tint` multiplies the paint), 1 a scumble (`tint` is the paint dragged over it), 2 a shadow
+    /// `mode` 0 a glaze (`tint` multiplies the paint), 1 light falling on it (`light_on`: `tint` near the light, `alt`
+    /// at its reach, `a` at most), 2 a shadow
     /// (`tint` is the shadow colour, worked in by `mix` with the value taken down by `step`).
     #[allow(clippy::too_many_arguments)]
-    pub fn glaze_area(&mut self, tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], z: f32, id: u32, mode: u32, mix: f32, step: f32) {
+    pub fn glaze_area(&mut self, tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], z: f32, id: u32, mode: u32, mix: f32, step: f32, alt: [f32; 3], a: f32) {
         let (off, o, sz) = self.mask.expect("a shape's glaze needs its mask handed over first (Recorder::use_mask)");
         let (x0, y0) = (o[0].max(0), o[1].max(0));
         let (x1, y1) = ((o[0] + sz[0] as i32 - 1).min(super::WI as i32 - 1), (o[1] + sz[1] as i32 - 1).min(super::HI as i32 - 1));
@@ -176,6 +177,8 @@ impl Recorder {
             tool: mode,
             bend: mix,
             along: step,
+            alt,
+            opacity: a,
             mask_off: off,
             mask_ox: o[0],
             mask_oy: o[1],
