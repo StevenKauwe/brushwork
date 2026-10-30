@@ -165,7 +165,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
         let t = clamp(across / s.nb, 0.0, 1.0);
         let slant = (s.slant_k * (t - 0.5) + s.slant_c) * s.end_w;
         let tt = 2.0 * t - 1.0;
-        let round = 0.38 * (tt * tt) * s.end_w;
+        let big = smoothk(28.0, 80.0, s.width / s.z);
+        let round = (0.38 + 0.9 * big) * (tt * tt) * s.end_w;
         let land_at = max((0.06 + 0.38 * r5) * s.end_w + slant + round, 0.0) / s.whole_len;
         let dry_at = 1.0 - max((0.30 + 0.85 * (1.0 - r1)) * s.end_w - slant + round, 0.18 * s.end_w) / s.whole_len;
         let landed = smoothk(land_at, land_at + (0.25 + 0.35 * r2) * s.end_w / s.whole_len, whole) * 1.0;
@@ -192,7 +193,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
             continue;
         }
         let arc = max(sin(whole * PI), 0.0);
-        var taper = 0.94 + 0.06 * arc;
+        var taper = (0.94 - 0.2 * big) + (0.06 + 0.2 * big) * pow(arc, 0.5);
         if (s.tool == 1u) {
             taper = 0.70 + 0.30 * pow(arc, 0.5);
         } else if (s.tool == 2u) {

@@ -366,6 +366,8 @@ impl Painting {
         let ridge_k = recipe().ridge;
         let size_k = (s.width / z / 40.0).clamp(0.3, 1.5);
         let knife_k = if s.tool == Tool::Knife { 1.6 } else { 1.0 };
+        // how big the brush is, as a hand holds it (see `round` below)
+        let big = smooth(28.0, 80.0, s.width / z);
         let bristle =
             |b: i32| -> [f32; 5] { [hf(id, b as u32), hf(id ^ 0x55, b as u32), hf(id ^ 0xAA, b as u32), hf(id ^ 0x3C, b as u32), hf(id ^ 0x77, b as u32)] };
         let nbi = nb.ceil() as i32 + 2;
@@ -505,7 +507,9 @@ impl Painting {
                 // touch keeps its ends in proportion.
                 let t = (across / nb).clamp(0.0, 1.0);
                 let slant = (slant_k * (t - 0.5) + slant_c) * end_w;
-                let round = 0.38 * (2.0 * t - 1.0).powi(2) * end_w;
+                // (a big brush's ends are rounded and feathered, its outer hairs shorter and splayed: they land and lift
+                // well in from the middle ones, so its marks never end in a square slab with hard corners)
+                let round = (0.38 + 0.9 * big) * (2.0 * t - 1.0).powi(2) * end_w;
                 let land_at = ((0.06 + 0.38 * r5) * end_w + slant + round).max(0.0) / whole_len;
                 // each bristle runs dry at its own point, and skips over the ground as it does
                 let dry_at = 1.0 - ((0.30 + 0.85 * (1.0 - r1)) * end_w - slant + round).max(0.18 * end_w) / whole_len;
@@ -528,7 +532,7 @@ impl Painting {
                 }
                 let arc = (whole * std::f32::consts::PI).sin().max(0.0);
                 let taper = match s.tool {
-                    Tool::Flat | Tool::Knife => 0.94 + 0.06 * arc,
+                    Tool::Flat | Tool::Knife => (0.94 - 0.2 * big) + (0.06 + 0.2 * big) * arc.powf(0.5),
                     Tool::Filbert => 0.70 + 0.30 * arc.powf(0.5),
                     Tool::Round => 0.35 + 0.65 * arc.powf(0.7),
                 };
@@ -1079,9 +1083,17 @@ fn blurred_cover(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [us
             hi[k] = hi[k].max(p[k]);
         }
     }
-    let o = [(lo[0].floor() as i32 - pad).max(0), (lo[1].floor() as i32 - pad).max(0)];
-    let e = [(hi[0].ceil() as i32 + pad).min(WI as i32), (hi[1].ceil() as i32 + pad).min(HI as i32)];
-    if e[0] <= o[0] || e[1] <= o[1] {
+    // The box is rasterised and blurred a blur's reach past the canvas edge, then cut back to the canvas. (It used
+    // to stop at the canvas edge, and the blurs, averaging only the samples inside the box, took what lay beyond
+    // the edge to be the average of what lay inside: a shape cut by the frame swelled into a lobe and a pinched
+    // neck along the edge, which slid as the shape moved. Beyond the reach nothing affects the canvas, so a shape
+    // thousands of pixels off screen costs no more than before.)
+    let r = (grow.max(1.0)) as usize;
+    let reach = 2 * r as i32 + 2;
+    let o = [(lo[0].floor() as i32 - pad).max(-reach), (lo[1].floor() as i32 - pad).max(-reach)];
+    let e = [(hi[0].ceil() as i32 + pad).min(WI as i32 + reach), (hi[1].ceil() as i32 + pad).min(HI as i32 + reach)];
+    let (co, ce) = ([o[0].max(0), o[1].max(0)], [e[0].min(WI as i32), e[1].min(HI as i32)]);
+    if ce[0] <= co[0] || ce[1] <= co[1] {
         return None;
     }
     let sz = [(e[0] - o[0]) as usize, (e[1] - o[1]) as usize];
@@ -1108,7 +1120,6 @@ fn blurred_cover(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [us
         }
     }
     // soften and grow: two box blurs, then a threshold below one half
-    let r = (grow.max(1.0)) as usize;
     let mut tmp = vec![0.0f32; m.len()];
     for _ in 0..2 {
         for y in 0..sz[1] {
@@ -1160,7 +1171,14 @@ fn blurred_cover(pts: &[[f32; 2]], grow: f32) -> Option<(Vec<f32>, [i32; 2], [us
             }
         }
     }
-    Some((m, o, sz))
+    // cut back to the canvas
+    let csz = [(ce[0] - co[0]) as usize, (ce[1] - co[1]) as usize];
+    let (dx, dy) = ((co[0] - o[0]) as usize, (co[1] - o[1]) as usize);
+    let mut out = Vec::with_capacity(csz[0] * csz[1]);
+    for y in 0..csz[1] {
+        out.extend_from_slice(&m[(y + dy) * sz[0] + dx..(y + dy) * sz[0] + dx + csz[0]]);
+    }
+    Some((out, co, csz))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1585,7 +1603,8 @@ fn paint_form_band(
         // A form being modelled is brushed round its edges; a flat plane of scenery is blocked in calmly in one
         // direction and only turns right at its edge. (The turn used to reach 1.6 brush widths in, up to 180 px:
         // every stroke of a big flat shape swung towards some edge and they crossed in a hatch all over it.)
-        let calm = 1.0 - form.clamp(0.0, 1.0);
+        // (a light's strokes follow its round edge too)
+        let calm = (1.0 - form.clamp(0.0, 1.0)) * (1.0 - mode.model);
         let pull = (-(near / (width * (1.6 - 1.0 * calm))).powi(2)).exp();
         let swirl = drift + turn_to * pull;
         // Broken colour, the way a painter remixes as they go: value and warmth drift slowly across the area, and
@@ -1646,7 +1665,8 @@ fn paint_form_band(
                 c: q,
                 angle: base + swirl,
                 // (a little longer than the paint it lays: its bristles land and lift a way in from its ends)
-                len: width * (3.6 + 3.6 * hf(id, 5)) * (1.0 - 0.35 * pull) * long,
+                // (a big brush's rounded ends cover less: its strokes run a little longer to overlap as much)
+                len: width * (3.6 + 3.6 * hf(id, 5)) * (1.0 - 0.35 * pull) * long * (1.0 + 0.3 * smooth(28.0, 80.0, width / z)),
                 width: width * (0.75 + 0.5 * hf(id, 6)),
                 // strokes are arcs from the wrist: mostly bowed the same way, never ruler-straight
                 bend: (0.12 + (hf(id, 7) - 0.5) * 0.2) / long,
@@ -1658,7 +1678,8 @@ fn paint_form_band(
                 // it in dark streaks)
                 pickup: ((0.22 + 0.3 * hf(id, 10)) * (0.3 + 0.7 * edge_wet * (0.3 + 0.7 * lost)) * (1.0 - 0.85 * thin_k) * (1.0 - mode.clean) + pickup_add)
                     .min(0.85),
-                load: (0.6 + 0.4 * hf(id, 11)) * body,
+                // (a light's paint is laid smooth and thin: its strokes leave no hard ridges to catch the light)
+                load: (0.6 + 0.4 * hf(id, 11)) * body * (1.0 - 0.5 * mode.model),
                 // the stroke's bristles belong to its place on its shape, not to how many strokes came before it
                 part: Some((h32(id) >> 2, true, true)),
                 span: (0.0, 1.0),
@@ -4694,6 +4715,56 @@ mod tests {
             eprintln!("texture of the light's mark: in place {still:.3}, travelled with the light {moved:.3}");
         }
         assert!(still > 0.6 && still > moved + 0.3, "the light's texture travels with it: in place {still:.3}, moved {moved:.3}");
+    }
+
+    #[test]
+    fn a_shape_cut_by_the_frame_is_the_same_shape_cut_off() {
+        // The owl film's moon at the top-left corner (about 0:57): cut by the frame it swelled into a lobe with a
+        // pinched neck along the edge, sliding as the moon moved, because the shape's coverage was blurred only up
+        // to the canvas edge and what lay beyond was taken to be the average of what lay inside. Slide a disc
+        // across the left and top edges and the corner: its mask must be the same disc's mask, cut off.
+        let disc = |cx: f32, cy: f32| -> Vec<[f32; 2]> {
+            (0..48)
+                .map(|i| {
+                    let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                    [cx + 120.0 * a.cos(), cy + 120.0 * a.sin()]
+                })
+                .collect()
+        };
+        let grow = 18.0;
+        let (rx, ry) = (900.0f32, 500.0f32);
+        let (rm, ro, rsz) = shape_mask(&disc(rx, ry), grow).unwrap();
+        let mut worst = (0.0f32, 0usize, [0.0f32; 2]);
+        for k in 0..=24 {
+            let s = -110.0 + k as f32 * 10.0;
+            for c in [[s, 400.0], [700.0, s], [s, s]] {
+                let (m, o, sz) = shape_mask(&disc(c[0], c[1]), grow).unwrap();
+                let (dx, dy) = ((rx - c[0]).round() as i32, (ry - c[1]).round() as i32);
+                let (mut flipped, mut big) = (0usize, 0.0f32);
+                for y in 0..sz[1] {
+                    for x in 0..sz[0] {
+                        let (px, py) = (x as i32 + o[0], y as i32 + o[1]);
+                        let (qx, qy) = (px + dx - ro[0], py + dy - ro[1]);
+                        let want =
+                            if qx >= 0 && qy >= 0 && (qx as usize) < rsz[0] && (qy as usize) < rsz[1] { rm[qy as usize * rsz[0] + qx as usize] } else { 0.0 };
+                        let got = m[y * sz[0] + x];
+                        big = big.max((got - want).abs());
+                        flipped += ((got >= 0.5) != (want >= 0.5)) as usize;
+                    }
+                }
+                if big > worst.0 {
+                    worst = (big, flipped, c);
+                }
+            }
+        }
+        assert!(
+            worst.0 < 0.01 && worst.1 == 0,
+            "a disc at ({:.0}, {:.0}) cut by the frame is not the same disc cut off: its cover is out by {:.2}, {} pixels on the wrong side of its outline",
+            worst.2[0],
+            worst.2[1],
+            worst.0,
+            worst.1
+        );
     }
 
     #[test]
