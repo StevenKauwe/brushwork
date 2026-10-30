@@ -4085,6 +4085,16 @@ mod tests {
 
     /// `OIL_TEST_BACKEND=gpu` (with the `gpu` feature) runs the tests on the GPU backend: the test canvas writes its
     /// strokes down and `done` lays them on the GPU before anything is measured.
+    /// The film's style is global, and tests run side by side: a test that paints with a style holds it for as long
+    /// as it paints (another test switching the cast half way through one test's frames moves the painter's focus
+    /// and recolours the whole picture between two of its frames).
+    fn styled(s: Style) -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_style(s);
+        guard
+    }
+
     fn test_gpu() -> bool {
         cfg!(feature = "gpu") && std::env::var("OIL_TEST_BACKEND").is_ok_and(|v| v == "gpu")
     }
@@ -4124,7 +4134,7 @@ mod tests {
             return;
         }
         let film = Film::new("dusk", 1.0, vec![Shot::new(0.0, "dusk", dusk)], "/nonexistent/dusk/film");
-        set_style(Style { cast: &["owl"], ..Style::DEFAULT });
+        let _style = styled(Style { cast: &["owl"], ..Style::DEFAULT });
         let cpu = plan_frame(&film, 0.0, 1, false).lit();
         let mut gpu = plan_frame(&film, 0.0, 1, true);
         assert!(gpu.rec.is_some(), "the frame was not recorded for the GPU");
@@ -4381,7 +4391,7 @@ mod tests {
         // sat at the size of a speck and at the size that gets a cut-in edge. Grow a disc from 6 px to 80 px
         // across in small steps: the painting may change only as much as the growth does, never in one jump.
         let film = Film::new("disc", 1.0, vec![Shot::new(0.0, "disc", disc)], "/nonexistent/disc/film");
-        set_style(Style::DEFAULT);
+        let _style = styled(Style::DEFAULT);
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
@@ -4446,7 +4456,7 @@ mod tests {
         // one as an area with its outline and its cut-in edge. Widen a slanted strap through all of that in small
         // steps: the painting may change only as much as the widening does, never in one jump.
         let film = Film::new("strap", 1.0, vec![Shot::new(0.0, "strap", strap)], "/nonexistent/strap/film");
-        set_style(Style::DEFAULT);
+        let _style = styled(Style::DEFAULT);
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
@@ -4497,7 +4507,7 @@ mod tests {
         // brush as wide as its slanted bounding box, spilling far past its sides, and an outline down each side as
         // wide as itself. The gap between two such strips must stay the colour of what is behind them.
         let film = Film::new("strips", 1.0, vec![Shot::new(0.0, "strips", strips)], "/nonexistent/strips/film");
-        set_style(Style::DEFAULT);
+        let _style = styled(Style::DEFAULT);
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
@@ -4548,7 +4558,7 @@ mod tests {
         // a near-black patch whatever it fell on. A shadow is a glaze: each band it crosses stays its own colour,
         // darker by a step, and the bands stay as different from each other as they were.
         let film = Film::new("shadowed", 1.0, vec![Shot::new(0.0, "s", shadowed)], "/nonexistent/shadowed/film");
-        set_style(Style { cast: &["post"], ..Style::DEFAULT });
+        let _style = styled(Style { cast: &["post"], ..Style::DEFAULT });
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
@@ -4585,7 +4595,7 @@ mod tests {
     #[test]
     fn a_shadow_fading_in_and_a_glow_growing_never_pop() {
         let film = Film::new("shadowed", 1.0, vec![Shot::new(0.0, "s", shadowed)], "/nonexistent/shadowed/film");
-        set_style(Style { cast: &["post"], ..Style::DEFAULT });
+        let _style = styled(Style { cast: &["post"], ..Style::DEFAULT });
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
@@ -4635,7 +4645,7 @@ mod tests {
         // own mark (the painting with the light over the painting without it), band-passed to keep its texture:
         // two positions of the light must agree with each other where they are, not where the light has moved to.
         let film = Film::new("gliding", 1.0, vec![Shot::new(0.0, "g", gliding)], "/nonexistent/gliding/film");
-        set_style(Style::DEFAULT);
+        let _style = styled(Style::DEFAULT);
         if test_gpu() {
             set_backend(Backend::Gpu);
         }
