@@ -116,7 +116,7 @@ from a flicker that was once seen in a film:
 - `a_fade_fades_and_leaves_without_a_pop`, `a_translucent_wash_is_mixed_down_not_glazed_in_streaks`
 - `a_strap_widening_from_a_line_to_an_area_never_pops`, `close_thin_strips_stay_apart`
 - `a_shadow_is_a_glaze_that_keeps_what_it_falls_on`, `a_shadow_fading_in_and_a_glow_growing_never_pop`
-- `a_light_gliding_over_a_still_sky_moves_no_texture`, ...
+- `a_light_gliding_over_a_still_sky_moves_no_texture`, `a_shape_cut_by_the_frame_is_the_same_shape_cut_off`, ...
 
 `cargo test --release` runs them on the CPU; `OIL_TEST_BACKEND=gpu cargo test --release --features brushwork/gpu`
 runs them on the GPU. For a rendered film, `flickscan <dir> <first> <last>` lists any block that changes for a frame
