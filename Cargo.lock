@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "brushwork"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "brushwork-kit",
  "brushwork-paint",
@@ -95,24 +95,25 @@ dependencies = [
 
 [[package]]
 name = "brushwork-kit"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "brushwork-paint"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "brushwork-kit",
 ]
 
 [[package]]
 name = "brushwork-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "brushwork",
  "brushwork-kit",
  "brushwork-paint",
  "js-sys",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -273,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "flickscan"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "image",
  "rayon",
@@ -1136,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "webcheck"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "serde_json",

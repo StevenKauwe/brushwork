@@ -23,7 +23,11 @@ A pure-Rust oil painter (see README.md). Used by music-to-movie-magic (the films
 `crates/brushwork-web` (UI + Web Worker, pure Rust; `web/` holds the page and the 8-line worker bootstrap).
 `tools/build-web.sh` builds `dist/`; `cargo run -p webcheck -- --dir dist [--phone]` checks it paints (CI runs it in
 WebKit and deploys `dist/` to https://stevenkauwe.github.io/brushwork/ from main). Keep `RUSTFLAGS` empty: iPhone
-WebKit rejects relaxed SIMD.
+WebKit rejects relaxed SIMD. The worker paints on the GPU through WebGPU when the browser has a real adapter
+(`open_gpu` / `paint_frame_async`: never block on wasm), else on the CPU. Headless Chromium only offers a software
+adapter (declined); to check the GPU path locally: `webcheck --browser chrome --headed --compare --expect-backend gpu`
+(on Hyprland add `WEBCHECK_CHROME_ARGS="--ozone-platform=wayland --start-fullscreen"`). Drawn outlines go through
+`stabilize.rs` (its tests: straight stays straight, loops stay closed, paused-on corners stay crisp).
 
 ## Releasing
 Tag `vX.Y.Z` on a green main, then bump the pin in music-to-movie-magic (`studio/Cargo.toml`) and CrabScape

@@ -1,6 +1,9 @@
 //! The page: lay down flat shapes with a finger or the mouse, then Paint hands them to the worker, which paints
-//! them in oil. The canvas says where it is in `data-state` (`flat`, `painting`, `painted`) and how long the last
-//! painting took in `data-paint-ms`.
+//! them in oil, on the GPU where the browser offers WebGPU, else on the CPU. The canvas says where it is in
+//! `data-state` (`flat`, `painting`, `painted`), how long the last painting took in `data-paint-ms` and what laid
+//! its strokes in `data-paint-backend` (`gpu` or `cpu`); the small `#backend` label over the canvas says the same to
+//! the visitor (`data-kind`). `?backend=cpu` in the address keeps the painting on the CPU. A drawn outline is calmed
+//! by [`stabilize`] (jitter out, corners and size kept) before it becomes a shape.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,6 +14,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, ImageData, MessageEvent, PointerEvent, Worker, WorkerOptions, WorkerType};
 
 use crate::scene::{self, PALETTE, Shape};
+use crate::stabilize;
 
 struct App {
     doc: Document,
@@ -20,7 +24,8 @@ struct App {
     w: usize,
     h: usize,
     shapes: Vec<Shape>,
-    drawing: Option<Vec<[f64; 2]>>,
+    /// the shape being drawn: the pointer's samples, `[x, y, time in ms]` in canvas pixels, as they came
+    drawing: Option<Vec<[f64; 3]>>,
     col: Col,
     subject: bool,
     outline: bool,
@@ -30,6 +35,8 @@ struct App {
     fresh: bool,
     show_painted: bool,
     busy: bool,
+    /// the address asked for the CPU (`?backend=cpu`)
+    force_cpu: bool,
 }
 
 type Shared = Rc<RefCell<App>>;
@@ -48,8 +55,10 @@ impl App {
     fn draw_flat(&self) {
         self.ctx.set_fill_style_str("#d8cfc0");
         self.ctx.fill_rect(0.0, 0.0, self.w as f64, self.h as f64);
+        // the shape being drawn, calmed as it will be kept (its end stays on the pen)
+        let live = self.drawing.as_ref().map(|d| stabilize::path(d, self.unit(), false));
         let mut all: Vec<(&[[f64; 2]], Col, bool)> = self.shapes.iter().map(|s| (s.pts.as_slice(), s.col, s.outline)).collect();
-        if let Some(d) = &self.drawing {
+        if let Some(d) = &live {
             all.push((d.as_slice(), self.col, self.outline));
         }
         for (pts, col, outline) in all {
@@ -116,15 +125,40 @@ impl App {
         msg.push(&JsValue::from_f64(self.seed as f64));
         msg.push(&JsValue::from_f64(self.w as f64));
         msg.push(&JsValue::from_f64(self.h as f64));
+        msg.push(&JsValue::from_str(if self.force_cpu { "cpu" } else { "auto" }));
         let _ = self.worker.post_message(&msg);
         self.status("Painting…", Some(0.0));
         self.show();
     }
 
-    /// canvas pixels under a pointer event
-    fn at(&self, e: &PointerEvent) -> [f64; 2] {
+    /// Say which backend paints (`gpu` or `cpu`) in the small label over the canvas; `detail` goes in its tooltip.
+    fn backend_label(&self, kind: &str, detail: &str) {
+        let Some(l) = el(&self.doc, "backend") else { return };
+        let (text, why) = match kind {
+            "gpu" => ("GPU", format!("Painting on the graphics card through WebGPU ({detail}).")),
+            _ if self.force_cpu => ("CPU", "Painting on the processor, as the address asks (?backend=cpu).".to_string()),
+            _ => ("CPU", format!("Painting on the processor: {detail}.")),
+        };
+        l.set_text_content(Some(text));
+        let _ = l.set_attribute("data-kind", kind);
+        let _ = l.set_attribute("title", &why);
+        let _ = l.set_attribute("aria-label", &format!("Backend: {text}. {why}"));
+        l.set_hidden(false);
+    }
+
+    /// canvas pixels under a pointer event, and when it happened (ms)
+    fn at(&self, e: &PointerEvent) -> [f64; 3] {
         let r = self.canvas.get_bounding_client_rect();
-        [(e.client_x() as f64 - r.left()) * self.w as f64 / r.width().max(1.0), (e.client_y() as f64 - r.top()) * self.h as f64 / r.height().max(1.0)]
+        [
+            (e.client_x() as f64 - r.left()) * self.w as f64 / r.width().max(1.0),
+            (e.client_y() as f64 - r.top()) * self.h as f64 / r.height().max(1.0),
+            e.time_stamp(),
+        ]
+    }
+
+    /// canvas pixels per screen (CSS) pixel
+    fn unit(&self) -> f64 {
+        self.w as f64 / self.canvas.get_bounding_client_rect().width().max(1.0)
     }
 }
 
@@ -168,6 +202,7 @@ pub fn app_start() -> Result<(), JsValue> {
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
     let worker = Worker::new_with_options("./worker.js", &opts)?;
+    let force_cpu = win.location().search().unwrap_or_default().contains("backend=cpu");
     let app: Shared = Rc::new(RefCell::new(App {
         doc: doc.clone(),
         canvas: canvas.clone(),
@@ -185,6 +220,7 @@ pub fn app_start() -> Result<(), JsValue> {
         fresh: false,
         show_painted: false,
         busy: false,
+        force_cpu,
     }));
 
     // the worker: progress, then the painting
@@ -198,8 +234,16 @@ pub fn app_start() -> Result<(), JsValue> {
                 return;
             }
             let msg = js_sys::Array::from(&data);
+            // the worker found (or lost) the GPU: ["backend", kind, detail]
+            if msg.get(0).as_string().as_deref() == Some("backend") {
+                let kind = msg.get(1).as_string().unwrap_or_default();
+                let shown = if a.force_cpu { "cpu" } else { kind.as_str() };
+                a.backend_label(shown, &msg.get(2).as_string().unwrap_or_default());
+                return;
+            }
             let px = js_sys::Uint8ClampedArray::new(&msg.get(0)).to_vec();
             let ms = msg.get(1).as_f64().unwrap_or(0.0);
+            let kind = msg.get(2).as_string().unwrap_or_else(|| "cpu".into());
             a.busy = false;
             match ImageData::new_with_u8_clamped_array_and_sh(wasm_bindgen::Clamped(&px), a.w as u32, a.h as u32) {
                 Ok(img) => {
@@ -207,7 +251,9 @@ pub fn app_start() -> Result<(), JsValue> {
                     a.fresh = true;
                     a.show_painted = true;
                     let _ = a.canvas.set_attribute("data-paint-ms", &format!("{ms:.0}"));
-                    a.status(&format!("Painted in {:.1} s (CPU, in a Web Worker). Seed {}.", ms / 1000.0, a.seed), None);
+                    let _ = a.canvas.set_attribute("data-paint-backend", &kind);
+                    let on = if kind == "gpu" { "on the GPU, through WebGPU" } else { "on the CPU" };
+                    a.status(&format!("Painted in {:.1} s ({on}, in a Web Worker). Seed {}.", ms / 1000.0, a.seed), None);
                 }
                 Err(_) => a.status("The painting came back the wrong size.", None),
             }
@@ -308,16 +354,38 @@ pub fn app_start() -> Result<(), JsValue> {
         a.show();
     });
     on::<PointerEvent>(target, "pointermove", &app, |a, e| {
-        let p = a.at(&e);
+        if a.drawing.is_none() {
+            return;
+        }
+        // every sample the device took since the last event (a touch screen often takes two per frame), where the
+        // browser offers them: the stabilizer reads the pen's speed from their times
+        let mut samples = vec![];
+        if js_sys::Reflect::has(&e, &JsValue::from_str("getCoalescedEvents")).unwrap_or(false) {
+            for c in e.get_coalesced_events().iter() {
+                if let Ok(c) = c.dyn_into::<PointerEvent>() {
+                    samples.push(a.at(&c));
+                }
+            }
+        }
+        if samples.is_empty() {
+            samples.push(a.at(&e));
+        }
         let Some(d) = a.drawing.as_mut() else { return };
-        if d.last().is_some_and(|q| (q[0] - p[0]).hypot(q[1] - p[1]) >= 3.0) {
-            d.push(p);
+        let mut moved = false;
+        for p in samples {
+            if d.last().is_some_and(|q| (q[0] - p[0]).hypot(q[1] - p[1]) >= 0.5) {
+                d.push(p);
+                moved = true;
+            }
+        }
+        if moved {
             a.show();
         }
     });
     for kind in ["pointerup", "pointercancel"] {
         on::<PointerEvent>(target, kind, &app, |a, _e| {
-            let Some(d) = a.drawing.take() else { return };
+            let Some(raw) = a.drawing.take() else { return };
+            let d = stabilize::outline(&raw, a.unit());
             let n = d.len();
             let area = (0..n).map(|i| d[i][0] * d[(i + 1) % n][1] - d[(i + 1) % n][0] * d[i][1]).sum::<f64>().abs() / 2.0;
             if n >= 3 && area > 30.0 {

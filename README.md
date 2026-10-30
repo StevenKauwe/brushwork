@@ -9,8 +9,11 @@ shape keeps its brushwork from frame to frame, and only moves where the shape mo
 It is the painter behind the oil-painted films in music-to-movie-magic and CrabScape's oil-painted art.
 
 **Try it:** [the canvas page](https://stevenkauwe.github.io/brushwork/). Draw flat shapes with a finger or the
-mouse, then press Paint. The engine runs in your browser, compiled to WebAssembly in a Web Worker. It paints the
-1024 x 576 canvas in about a second on a desktop.
+mouse, then press Paint. The engine runs in your browser, compiled to WebAssembly in a Web Worker. Where the browser
+offers WebGPU it lays the strokes on the graphics card (the label on the canvas says `GPU`), otherwise on the
+processor (`CPU`; `?backend=cpu` asks for it). On a desktop the 1024 x 576 canvas takes about 0.4 s on the GPU and
+1 s on the CPU. A drawn outline is calmed before it is painted: the hand's jitter comes out, while its size, its ends
+and any corner the hand paused on stay where they were.
 
 ## Crates
 
@@ -21,7 +24,7 @@ mouse, then press Paint. The engine runs in your browser, compiled to WebAssembl
 | [`brushwork-kit`](crates/brushwork-kit) | the brush kit: time, easing, motion, geometry, colour, and the spectral pigment mixer |
 | [`tools/flickscan`](tools/flickscan) | finds flickering strokes in a rendered frame sequence |
 | [`brushwork-web`](crates/brushwork-web) | the canvas page (wasm-bindgen + web-sys); `tools/build-web.sh` builds it into `dist/` |
-| [`tools/webcheck`](tools/webcheck) | opens the page in WebKit or Chromium through WebDriver and checks it paints |
+| [`tools/webcheck`](tools/webcheck) | opens the page in WebKit or Chromium through WebDriver and checks it paints, says which backend painted, and (`--compare`) that the browser's GPU agrees with its CPU |
 
 ## Use
 
@@ -56,8 +59,13 @@ The CPU engine is the reference. A frame takes about 3-6 s on one core, and `run
 With the `gpu` feature and `OIL_BACKEND=gpu` (or `brushwork::set_backend(Backend::Gpu)`), the CPU still plans
 every stroke, and the GPU (wgpu) lays them, one thread per pixel walking its tile's strokes in the CPU's order. On an
 RTX 3090 that is about 14 times all 16 CPU threads. A handful of colour values per frame differ from the CPU's, by 1
-to 5 levels out of 255, from the GPU's own `sin`, `exp` and division. Frames with watercolour or bite holes stay on
-the CPU.
+to 5 levels out of 255, from the GPU's own `sin`, `exp` and division (and very rarely a pixel right at a threshold
+falls the other way: at most 0.01 % of values may differ, 0.001 % by more than 5 levels; `the_gpu_paints_what_the_cpu_paints`
+and `webcheck --compare` hold it to that). Frames with watercolour or bite holes stay on the CPU.
+
+In a browser nothing may block waiting for the GPU, so there the backend is opened with `brushwork::open_gpu().await`
+and frames painted with `brushwork::paint_frame_async(...).await` (the canvas page does this in its Web Worker,
+compute only, no canvas). Natively `paint_frame` is unchanged.
 
 ## Steadiness, and how it is tested
 

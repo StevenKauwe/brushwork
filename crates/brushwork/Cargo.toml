@@ -13,9 +13,19 @@ brushwork-paint.workspace = true
 image.workspace = true
 rayon.workspace = true
 bytemuck.workspace = true
+
+# Natively wgpu drives Vulkan, Metal or DirectX itself, and a frame may block until the GPU is done.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 
+# In a browser wgpu is a thin layer over the browser's own WebGPU (no drivers, no shader compiler), and nothing may
+# block: the GPU is opened and read back with `await` (`open_gpu`, `paint_frame_async`). The page's Worker is
+# single-threaded, so wgpu's handles may be shared as if they were thread-safe.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"] }
+
 [features]
-# lay strokes on the GPU (wgpu); the CPU engine stays the reference. Pick it at run time with OIL_BACKEND=gpu.
+# lay strokes on the GPU (wgpu; in a browser, WebGPU); the CPU engine stays the reference. Pick it at run time with
+# OIL_BACKEND=gpu (in a browser: `open_gpu`, then `set_backend`).
 gpu = ["dep:wgpu", "dep:pollster"]
