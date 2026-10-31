@@ -304,7 +304,7 @@ impl Painting {
         // the paint already there, where the brush lands
         let start = [s.c[0] - cs * s.len * 0.4, s.c[1] - sn * s.len * 0.4];
         // a stroke that lands off the canvas has nothing to pick up (not whatever happens to be at the canvas edge)
-        let under = s.picked.unwrap_or_else(|| flat_under(&self.flat, start[0], start[1], s.width * 0.3, s.col));
+        let under = s.picked.unwrap_or_else(|| flat_under(&self.flat, start[0], start[1], s.width * 0.3));
         let premix = PREMIX.with(|p| p.get());
         let fade = FADE.with(|f| f.get());
         if fade <= 0.0 {
@@ -1269,11 +1269,14 @@ fn signed_depth(pts: &[[f32; 2]], q: [f32; 2], cap: f32) -> f32 {
 }
 
 /// The plain picture's colour around (x, y), averaged over a little patch of radius `r`: what a brush landing
-/// there picks up. A single pixel would flip between two colours whenever an edge in the plain picture moved
-/// across it by a fraction of a pixel, changing the whole stroke's colour from one frame to the next. Off the
-/// canvas there is nothing to pick up, so the result slides to `none` over one patch radius past the edge.
-fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32, none: [f32; 3]) -> [f32; 3] {
-    let r = r.max(1.0);
+/// there picks up, and what a translucent stroke is mixed down with. A single pixel would flip between two colours
+/// whenever an edge in the plain picture moved across it by a fraction of a pixel, changing the whole stroke's
+/// colour from one frame to the next. Off the canvas it is what lies at the canvas's edge nearest the point.
+/// (It used to slide to the stroke's own colour there: a translucent stroke starting off the frame was then mixed
+/// down with itself, laid at full strength, and a faint band cut by the frame grew a bright white tip, coming and
+/// going as the band moved across the edge.)
+fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32) -> [f32; 3] {
+    let r = r.clamp(1.0, HI as f32 * 0.45);
     let bil = |x: f32, y: f32| -> [f32; 3] {
         let (x, y) = (x.clamp(0.0, WI as f32 - 1.001), y.clamp(0.0, HI as f32 - 1.001));
         let (x0, y0) = (x.floor() as usize, y.floor() as usize);
@@ -1281,6 +1284,8 @@ fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32, none: [f32; 3]) -> [f32
         let (a, b, c, d) = (flat[y0 * WI + x0], flat[y0 * WI + x0 + 1], flat[(y0 + 1) * WI + x0], flat[(y0 + 1) * WI + x0 + 1]);
         std::array::from_fn(|k| (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy)
     };
+    // (the patch is moved in onto the canvas as a whole, so it never straddles the edge)
+    let (x, y) = (x.clamp(r, WI as f32 - 1.0 - r), y.clamp(r, HI as f32 - 1.0 - r));
     let mut sum = [0.0f32; 3];
     for j in -1..=1 {
         for i in -1..=1 {
@@ -1290,9 +1295,7 @@ fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32, none: [f32; 3]) -> [f32
             }
         }
     }
-    let outside = (-x).max(x - (WI as f32 - 1.0)).max(-y).max(y - (HI as f32 - 1.0)).max(0.0);
-    let w = smooth(0.0, r, outside);
-    std::array::from_fn(|k| sum[k] + (none[k] - sum[k]) * w)
+    sum
 }
 
 /// How much of the plain picture around (x, y) is paint (not the bare ground), over the same patch `flat_under`
@@ -1493,7 +1496,7 @@ fn paint_form_band(
     let soft = {
         let s = far;
         let r = (thick * 0.3).max(2.0 * z);
-        let behind = flat_under(&p.flat, c[0], c[1], r, col);
+        let behind = flat_under(&p.flat, c[0], c[1], r);
         s * (1.0 - smooth(0.16, 0.36, contrast(col, behind)) * wet_under(&p.wet, c[0], c[1], r))
     };
     lo = [lo[0].max(-80.0), lo[1].max(-80.0)];
@@ -1647,12 +1650,12 @@ fn paint_form_band(
         }
         // what the brush works into is the paint where it lays, at its middle (a stroke laid inwards from just
         // outside a shape used to load up at its start with whatever lay beyond the edge, often the bare ground)
-        let picked = flat_under(&p.flat, q[0], q[1], width * 0.3, col);
+        let picked = flat_under(&p.flat, q[0], q[1], width * 0.3);
         let mut lost = 0.0;
         if edge_wet > 0.01 {
             let r = width * 0.5;
             let wet = wet_under(&p.wet, q[0], q[1], r);
-            let under = flat_under(&p.flat, q[0], q[1], r, col);
+            let under = flat_under(&p.flat, q[0], q[1], r);
             lost = 1.0 - smooth(0.05 + 0.06 * soft, 0.22 + 0.1 * soft, contrast(col, under));
             let blend = edge_wet * wet * lost * (0.14 + 0.3 * soft) * (1.0 - mode.clean);
             if blend > 0.004 {
@@ -1709,7 +1712,10 @@ fn paint_form_band(
     // the cut-in edge comes in by degrees as a shape grows past the size that has one (by its true breadth: a
     // thin shape has no room for a band cut in along each side)
     let contour_k = smooth(SMALLEST * 3.5 * z, SMALLEST * 4.5 * z, thick);
-    let contour_k = contour_k * (1.0 - mode.clean);
+    // (a translucent wash, a veil of light or colour, has no band cut in round it: a painter glazes or scumbles it
+    // and leaves its edge soft. Its cut-in sweeps, a flat's ribbed marks along each side, were laid over the shape's
+    // own tint in the plain picture, so they came out twice as strong: a ladder of bright dashes down every edge.)
+    let contour_k = contour_k * (1.0 - mode.clean) * smooth(0.55, 0.9, PREMIX.with(|p| p.get()));
     if contour_k > 0.001 && contour {
         let _contour = Fade::set(contour_k);
         // lost and found: a modelled subject keeps much of its cut-in edge everywhere; scenery only where it
@@ -1726,8 +1732,8 @@ fn paint_form_band(
 fn found_edge(p: &Painting, col: [f32; 3], q: [f32; 2], t: [f32; 2], reach: f32, keep: f32, soft: f32) -> f32 {
     let nrm = [-t[1], t[0]];
     let r = (reach * 0.4).max(1.0);
-    let a = flat_under(&p.flat, q[0] + nrm[0] * reach, q[1] + nrm[1] * reach, r, col);
-    let b = flat_under(&p.flat, q[0] - nrm[0] * reach, q[1] - nrm[1] * reach, r, col);
+    let a = flat_under(&p.flat, q[0] + nrm[0] * reach, q[1] + nrm[1] * reach, r);
+    let b = flat_under(&p.flat, q[0] - nrm[0] * reach, q[1] - nrm[1] * reach, r);
     let d = contrast(col, a).max(contrast(col, b));
     keep + (1.0 - keep) * smooth(0.06 + 0.08 * soft, 0.24 + 0.12 * soft, d)
 }
@@ -1946,7 +1952,7 @@ fn sweep(
             path[path.len() - 1][1]
         );
     }
-    let picked = flat_under(&p.flat, path[0][0], path[0][1], width * 0.3, col);
+    let picked = flat_under(&p.flat, path[0][0], path[0][1], width * 0.3);
     let mut walked = 0.0;
     for (i, w) in path.windows(2).enumerate() {
         let (a, b) = (w[0], w[1]);
@@ -2198,7 +2204,7 @@ fn paint_glow(p: &mut Painting, centre: [f32; 2], radius: f32, col: [f32; 3], a:
     }
     // near the light the paint goes to its own colour; further out to the light's colour mixed (as pigment) with
     // the paint the light falls on there, as a painter mixes the halo from the sky's colour and the moon's
-    let sky = flat_under(&p.flat, centre[0], centre[1], r * 0.3, col);
+    let sky = flat_under(&p.flat, centre[0], centre[1], r * 0.3);
     let outer = pigment_mix(col, sky, 0.5);
     p.light_area(&m, o, sz, col, outer, a);
 }
@@ -2685,7 +2691,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     _ => {}
                 }
                 let behind_r = (thick * 0.3).max(2.0 * zoom);
-                let behind = flat_under(&p.flat, centre[0], centre[1], behind_r, c);
+                let behind = flat_under(&p.flat, centre[0], centre[1], behind_r);
                 let behind_wet = wet_under(&p.wet, centre[0], centre[1], behind_r);
                 // Unlabelled, a translucent wash darker than what it lies on is a glaze (an eye's shade, a stain),
                 // by degrees of how translucent and how much darker it is.
@@ -2711,7 +2717,8 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     Role::Auto if !is_cast(&it.family) => smooth(0.76, 0.84, lum(c)) * smooth(0.3, 0.18, lum(behind)) * behind_wet,
                     _ => 0.0,
                 };
-                let clean = if it.role == Role::Highlight { 1.0 } else { light_k };
+                // (an accent is a clean touch too, as the vocabulary says: an eye white picks up no green from the shell)
+                let clean = if matches!(it.role, Role::Highlight | Role::Accent) { 1.0 } else { light_k };
                 // a light lights the air and the paint round it: a glow as far as the haze carries it, and a
                 // brighter aureole close in (painted onto what is already there, before the light itself)
                 if light_k > 0.001 {
@@ -2812,14 +2819,18 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                     //    eye, a pupil, a glint). Accents are where the eye goes, so they are painted crisply, within
                     //    their shape, with the smallest brush and little picked-up colour.
                     if knife_k > 0.001 {
-                        // a light accent with no outline is a highlight: one touch of the knife, thick
+                        // a light accent with no outline is a highlight: one small round touch of thick paint, as
+                        // a painter dots in a star or a glint with the tip of a loaded round. (It was a palette
+                        // knife's slab, which a small light read as: a square.) Faint, it is the paint let down
+                        // with what is there, so it fades in by degrees.
                         let _knife = Fade::set(knife_k);
+                        let w = (ext_min * 1.15).max(small_brush * 0.7);
                         p.stroke(
                             &Stroke {
                                 c: mid,
                                 angle: -0.5,
-                                len: (ext_max * 1.2).max(small_brush * 1.4),
-                                width: (ext_min * 1.05).max(small_brush * 0.8),
+                                len: (ext_max * 1.15).max(w * 1.1),
+                                width: w,
                                 bend: 0.0,
                                 col: c,
                                 alt: c,
@@ -2828,7 +2839,7 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
                                 load: 1.3,
                                 part: Some((h32(id ^ 0x9E37) >> 2, true, true)),
                                 span: (0.0, 1.0),
-                                tool: Tool::Knife,
+                                tool: Tool::Round,
                                 picked: None,
                                 along: 0.0,
                             },
