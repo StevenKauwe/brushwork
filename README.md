@@ -68,10 +68,12 @@ say what a shape **is** (`brushwork_paint::Role`, with `Po::role`) and the light
 | `Glaze` | a transparent tint: the paint below shows through |
 | `Light` | a light source (moon, lamp, window): clean luminous paint, softly modelled, fully covered, no cut-in edge |
 | `Highlight`, `Accent`, `Line` | a clean loaded touch; a crisp small detail; one pull of a rigger |
+| `Opening` (`Po::opening(behind, light)`) | a hole (a bite in a leaf): painted on as the far layer's own paint (what was painted behind the thing it is cut in, unless the film says what), lighter where light comes through; its rim dark or backlit as the light dictates; strong light spills the near surface's own backlit colour round it. Nothing is erased |
+| `Translucent` (`Po::translucent(light, diffuse, behind)`) | lit from behind (a leaf, a wing, a membrane): the material's own colour mixed lighter, richer and warmer; frosted (`diffuse` 1): an opaque, light, softened rendering of what is behind it. Never a transparency or an overlay |
 
 Light falls on what is already painted. A `Light` lights the air and the paint round it (as far as the scene's
 `Lighting::haze` carries it, and a brighter aureole close in), and so do the film's glows (`Rec::glows`): the strokes
-there are lifted towards the light's colour, mixed with theirs as pigment, more on the ridges of their paint that
+there are mixed lighter in their own colour with a little of the light's, more on the ridges of their paint that
 catch it and less in the hollows between. The light has no texture of its own: as it moves (a moon rising, a lamp
 carried past a wall) the brushwork stays where it is and each stroke only grows lighter or darker
 (`a_light_gliding_over_a_still_sky_moves_no_texture`). Forms in the cast turn from the declared key light over a soft
