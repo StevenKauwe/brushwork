@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use brushwork_kit::{Col, H, P, W};
 
-use crate::semantics::{Lighting, Role};
+use crate::semantics::{Lighting, Optics, Role};
 
 /// The default outline colour (PAL.ink).
 pub const PAL_INK: Col = brushwork_kit::pal::INK;
@@ -50,10 +50,24 @@ pub struct Po {
     pub role: Role,
     /// For a shadow: the family (boil key, matched as a prefix) of what casts it.
     pub caster: Option<&'static str>,
+    /// For an opening or a translucent shape: what is behind it and how light passes (see [`Optics`]).
+    pub optics: Optics,
 }
 impl Default for Po {
     fn default() -> Self {
-        Po { wash: None, wash_op: 255.0, fill: None, fill_op: 170.0, ink: Ink::Default, sw: 1.0, curv: 0.0, wc: WC, role: Role::Auto, caster: None }
+        Po {
+            wash: None,
+            wash_op: 255.0,
+            fill: None,
+            fill_op: 170.0,
+            ink: Ink::Default,
+            sw: 1.0,
+            curv: 0.0,
+            wc: WC,
+            role: Role::Auto,
+            caster: None,
+            optics: Optics { behind: None, light: 0.0, diffuse: 0.0 },
+        }
     }
 }
 /// A flat colour shape with the default ink outline.
@@ -122,6 +136,20 @@ impl Po {
     /// A cast shadow, and the family that casts it (a prefix of its boil key): the shape is a hint of where the
     /// shadow falls, and the painter derives its colour from what it falls on and the scene's light, its softness
     /// from how far it is from what casts it.
+    /// An opening (a hole, a bite) through which `behind` is seen (None: whatever was painted behind the thing it is
+    /// cut in), with `light` (0 to 1) coming through it: painted on as that far layer's own paint, never erased (see
+    /// [`Role::Opening`]).
+    pub fn opening(mut self, behind: Option<Col>, light: f64) -> Po {
+        self.role = Role::Opening;
+        self.optics = Optics::opening(behind, light);
+        self
+    }
+    /// Something light passes through (see [`Role::Translucent`], [`Optics::translucent`]).
+    pub fn translucent(mut self, light: f64, diffuse: f64, behind: Option<Col>) -> Po {
+        self.role = Role::Translucent;
+        self.optics = Optics::translucent(light, diffuse, behind);
+        self
+    }
     pub fn shadow_of(mut self, caster: &'static str) -> Po {
         self.role = Role::Shadow;
         self.caster = Some(caster);
@@ -155,6 +183,8 @@ pub struct Item {
     pub role: Role,
     /// For a shadow: the family that casts it.
     pub caster: Option<&'static str>,
+    /// For an opening or a translucent shape: what is behind it and how light passes.
+    pub optics: Optics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -309,7 +339,7 @@ impl Rec {
         let family = if o.wash.is_none() && o.fill.is_some() && o.ink == Ink::None { format!("{}@wc", self.key) } else { self.key.clone() };
         let id = self.ident(&family, tag);
         let pts = self.xform(pts);
-        self.items.push(Item { family, id, screen: !self.in_cam, kind, pts, wc: o.wc, role: o.role, caster: o.caster });
+        self.items.push(Item { family, id, screen: !self.in_cam, kind, pts, wc: o.wc, role: o.role, caster: o.caster, optics: o.optics });
     }
 
     /// The light this frame is seen in: where the key light is, its colour and strength, and the ambient light in
@@ -337,7 +367,17 @@ impl Rec {
         let family = self.key.clone();
         let id = self.ident(&family, tag);
         let pts = self.xform(pts);
-        self.items.push(Item { family, id, screen: !self.in_cam, kind: Kind::Line { col, width, curv }, pts, wc: WC, role: Role::Line, caster: None });
+        self.items.push(Item {
+            family,
+            id,
+            screen: !self.in_cam,
+            kind: Kind::Line { col, width, curv },
+            pts,
+            wc: WC,
+            role: Role::Line,
+            caster: None,
+            optics: Optics::default(),
+        });
     }
 
     /// Additive halos: (x, y, r, colour, a). Light adds, so it shows on dark grounds and barely on light ones.
@@ -359,6 +399,7 @@ impl Rec {
                 wc: WC,
                 role: Role::Light,
                 caster: None,
+                optics: Optics::default(),
             });
         }
     }

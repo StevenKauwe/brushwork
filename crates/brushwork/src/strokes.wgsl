@@ -121,7 +121,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
                 let g = clamp(s.opacity * m * (0.45 + 1.1 * tex), 0.0, 1.0);
                 let inner = vec3<f32>(s.col_r, s.col_g, s.col_b);
                 let outer = vec3<f32>(s.alt_r, s.alt_g, s.alt_b);
-                c0 = c0 + (outer + (inner - outer) * m - c0) * g;
+                // its own colour mixed lighter (lift in lib.rs), with a little of the light's colour
+                let lw = vec3<f32>(0.3, 0.59, 0.11);
+                let v = dot(c0, lw);
+                let lifted = clamp(c0 * ((v + (1.0 - v) * 0.55) / max(v, 0.02)), vec3<f32>(0.0), vec3<f32>(1.0));
+                let lightc = outer + (inner - outer) * m;
+                c0 = c0 + (lifted + (lightc - lifted) * 0.35 - c0) * g;
             } else if (s.tool == 2u) {
                 let g = m * (0.82 + 0.25 * tex);
                 {

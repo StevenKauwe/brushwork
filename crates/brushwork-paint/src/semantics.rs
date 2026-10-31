@@ -24,6 +24,8 @@ use brushwork_kit::Col;
 /// | `Glaze` | a transparent tint over what is below | a thin coloured layer: what is below shows through |
 /// | `Light` | a light source (moon, lamp, sun, window) | clean luminous paint, softly modelled, a crisp but not cut-out edge; it lights what is round it (see below) |
 /// | `Accent` | a small detail that must read | crisp, small brush, clean paint |
+/// | `Opening` | a hole in something (a bite in a leaf), and what is seen through it ([`Optics::opening`]) | painted on as that far layer's own paint, calm and clean; its rim lit or dark as the light dictates; strong light through it spills a little of the near surface's own backlit colour round it |
+/// | `Translucent` | something light passes through: a leaf lit from behind, a wing, a membrane, frosted glass, mist ([`Optics::translucent`]) | painted on, never overlaid: the material's own colour mixed lighter, warmer and richer where light passes through; frosted, a softened, light, opaque rendering of what is behind it, scumbled on |
 /// | `Line` | linework drawn as a shape | one pull of a rigger |
 ///
 /// Light falls on what is already painted: a light (and a glow, `Rec::glows`) lifts the paint round it towards its
@@ -44,6 +46,36 @@ pub enum Role {
     Light,
     Accent,
     Line,
+    Opening,
+    Translucent,
+}
+
+/// What a shape does with light, for the roles that need it (`Opening`, `Translucent`): the optics of the subject,
+/// from which the painter derives the paint. Nothing here is a layer operation: an opening is not erased, a
+/// translucent shape is not made transparent; both are painted on, in paint mixed for what the eye sees.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Optics {
+    /// What is seen through an opening, or behind a translucent shape: its colour (0-255). None: what was painted
+    /// there before the thing the opening is cut in (or the translucent shape itself) was painted over it.
+    pub behind: Option<Col>,
+    /// How much light comes through (0 to 1): the sun through a bite, a lamp behind a membrane.
+    pub light: f64,
+    /// How much it scatters what passes through (0 to 1): 0 clear (a leaf lit from behind, a wing), 1 frosted glass
+    /// or mist (what is behind is seen only as soft, light shapes of its colour).
+    pub diffuse: f64,
+}
+
+impl Optics {
+    /// An opening through which `behind` is seen (None: whatever was painted behind the thing it is cut in), with
+    /// `light` (0 to 1) coming through it.
+    pub const fn opening(behind: Option<Col>, light: f64) -> Optics {
+        Optics { behind, light, diffuse: 0.0 }
+    }
+    /// Something light passes through: `light` (0 to 1) of it, scattered by `diffuse` (0 clear .. 1 frosted), with
+    /// `behind` (if known) behind it.
+    pub const fn translucent(light: f64, diffuse: f64, behind: Option<Col>) -> Optics {
+        Optics { behind, light, diffuse }
+    }
 }
 
 /// The light a scene is seen in. Colours are 0-255 like every other colour a film draws with.
