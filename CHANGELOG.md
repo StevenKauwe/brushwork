@@ -2,6 +2,33 @@
 
 Versions before 0.6.0 are described in their `brushwork 0.X.Y:` commits.
 
+## 0.6.1
+
+One sweep along a path as a public API, and a long strip painted and lifted only where it shows. **No pixel changes:** every
+existing stroke, light, layer and frame is byte for byte what 0.6.0 painted (`a_new_canvas_paints_as_it_always_has`
+holds; the example frame and the photo painters' outputs hash the same before and after).
+
+- `sweep_path(path, &Sweep) -> Vec<Stroke>`: one sweep of the brush along a path, as the strokes to lay in order. A
+  piece from each point to the next, all sharing the sweep's bristles (`ident`), each knowing its stretch of the
+  whole stroke (`span`) and how far along it is (`along`), so the brush lands once, thins and dries as it goes, and
+  lifts once. `Sweep::new(tool, width, col, ident)` and struct update for the rest (`alt`, `picked`, `opacity`,
+  `pickup`, `load`, `bend`, `span`, `along`).
+- `Width`: `Even`, `Points` (one per point; a piece is the mean of its ends), `Nib`, or `By` (any closure of the
+  piece and its direction). `Nib { width, angle, edge }` is a broad nib: `mark(dir)` is
+  `width * |sin(dir - angle)|`, never under `width * edge`.
+- `Picked`: `Under` (each piece picks up what is under it, as a lone stroke does), `Same(colour)`, or `Along` (a
+  colour by how far along the whole stroke each piece is).
+- A stroke laid as several paths: give each its stretch (`span`) and `along`; it lands only at the start of the first
+  and lifts only at the end of the last.
+- `Painting::layer_rgba_in(origin, size)`: exactly that rectangle of `layer_rgba()`, lighting only it (and the relief a
+  pixel round it), for showing a painting as it is being painted.
+- `Painting::with_origin([x, y])`: a canvas as a window onto a larger one, so its light shows the larger canvas's
+  weave there: a window lights exactly as the whole does (but for its outermost two pixels), given the strokes that
+  reach it, moved by -origin. With `with_size`, only the part of a long strip that shows need be painted. A canvas's
+  origin is [0, 0] unless set, and nothing else changes.
+- The painters' own sweeps (outlines, the photo painters' strokes) walk their paths with the same code as
+  `sweep_path`; what they lay is unchanged.
+
 ## 0.6.0
 
 A canvas of any size, and the paint lifted off it as a layer. **No pixel changes:** `Painting::new()` is still the
