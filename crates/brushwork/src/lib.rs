@@ -253,6 +253,8 @@ pub struct Painting {
     pub view: f32,
     /// How much of each pixel the strokes cover, when kept (`keep_coverage`).
     coverage: Option<Box<Coverage>>,
+    /// Where the canvas sits on a larger one it is a window onto (`with_origin`): its weave is that one's.
+    origin: [usize; 2],
 }
 
 /// What `layer_rgba` lifts the paint off: the canvas as it stood when coverage began to be kept (one colour if it
@@ -388,6 +390,7 @@ impl Painting {
             planning_clip: None,
             view: 1.0,
             coverage: None,
+            origin: [0, 0],
         }
     }
 
@@ -414,12 +417,29 @@ impl Painting {
             planning_clip: None,
             view: 1.0,
             coverage: None,
+            origin: [0, 0],
         }
     }
 
     /// The canvas's size in pixels, [width, height].
     pub fn size(&self) -> [usize; 2] {
         self.canvas
+    }
+
+    /// This canvas as a window onto a larger one, its top left at `origin` there: the canvas weave the light shows is
+    /// the larger canvas's at that place, so a window lights its paint exactly as the whole canvas does there (all
+    /// but its outermost two pixels, whose relief is read off the window's edge), given every stroke that reaches
+    /// it. Strokes are laid in the window's own pixels: move them by -origin (moved by whole pixels, a stroke lays
+    /// the same paint). For painting only the part of a long strip that shows. (Watercolour's paper grain is the
+    /// window's own.)
+    pub fn with_origin(mut self, origin: [usize; 2]) -> Painting {
+        self.origin = origin;
+        self
+    }
+
+    /// Where the canvas sits on the larger one it is a window onto ([0, 0] if it is not one).
+    pub fn origin(&self) -> [usize; 2] {
+        self.origin
     }
 
     /// Keep a coverage channel from here on: how much of each pixel the strokes laid after this call cover, from
@@ -457,6 +477,7 @@ impl Painting {
             planning_clip: None,
             view: 1.0,
             coverage: None,
+            origin: [0, 0],
         }
     }
 
@@ -886,7 +907,7 @@ impl Painting {
     /// Light the paint's relief from the upper left and add the canvas weave where it is thin.
     pub fn lit(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.col.len() * 3];
-        self.light(|i| Some(self.col[i]), |_| 1.0, &mut out, 3);
+        self.light(|i| Some(self.col[i]), |_| 1.0, &mut out, 3, [0, 0], self.canvas);
         out
     }
 
@@ -897,7 +918,18 @@ impl Painting {
     /// the paint covers the canvas completely the colour is exactly `lit`'s. None unless coverage is kept. Glazes,
     /// shades and lights the scene painters lay over bare canvas are not part of the layer.
     pub fn layer_rgba(&self) -> Option<Vec<u8>> {
+        self.layer_rgba_in([0, 0], self.canvas)
+    }
+
+    /// `layer_rgba` for one rectangle of the canvas (`origin` its top left, `size` its width and height, in pixels):
+    /// exactly the pixels the whole layer has there, row by row, for the price of lighting only that much (the light
+    /// at a pixel reads the relief a pixel or two round it, wherever the rectangle's edge is). For showing a painting
+    /// as it is being painted, a little at a time. None unless coverage is kept; panics if the rectangle runs off the
+    /// canvas.
+    pub fn layer_rgba_in(&self, origin: [usize; 2], size: [usize; 2]) -> Option<Vec<u8>> {
         let cv = self.coverage.as_ref()?;
+        let [wi, hi] = self.canvas;
+        assert!(origin[0] + size[0] <= wi && origin[1] + size[1] <= hi, "the rectangle runs off the canvas");
         let uniform = cv.ground.len() == 1;
         let paint = |i: usize| {
             let (a, c) = (cv.a[i], self.col[i]);
@@ -912,18 +944,39 @@ impl Painting {
             let g = cv.ground[if uniform { 0 } else { i }];
             Some(std::array::from_fn(|k| (g[k] + (c[k] - g[k]) / a).clamp(0.0, 1.0)))
         };
-        let mut out = vec![0u8; self.col.len() * 4];
-        self.light(paint, |i| cv.a[i], &mut out, 4);
-        for (px, a) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cv.a) {
-            px[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let mut out = vec![0u8; size[0] * size[1] * 4];
+        if out.is_empty() {
+            return Some(out);
+        }
+        self.light(paint, |i| cv.a[i], &mut out, 4, origin, size);
+        for (r, row) in out.chunks_exact_mut(size[0] * 4).enumerate() {
+            let at = (origin[1] + r) * wi + origin[0];
+            for (px, a) in row.as_chunks_mut::<4>().0.iter_mut().zip(&cv.a[at..at + size[0]]) {
+                px[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
         }
         Some(out)
     }
 
-    /// `lit` for any colours: lights `col(i)` with the relief of the paint, its canvas weave scaled by `under(i)`,
-    /// into the first three channels of each `stride` bytes of `out` (a pixel whose colour is None is left alone).
-    fn light(&self, col: impl Fn(usize) -> Option<[f32; 3]>, under: impl Fn(usize) -> f32, out: &mut [u8], stride: usize) {
+    /// `lit` for any colours, over one rectangle of the canvas (`origin`, `size`): lights `col(i)` (`i` the pixel's
+    /// place on the whole canvas) with the relief of the paint, its canvas weave scaled by `under(i)`, into the first
+    /// three channels of each `stride` bytes of `out`, the rectangle row by row (a pixel whose colour is None is left
+    /// alone). A pixel is lit the same whatever rectangle it is lit in.
+    fn light(
+        &self,
+        col: impl Fn(usize) -> Option<[f32; 3]>,
+        under: impl Fn(usize) -> f32,
+        out: &mut [u8],
+        stride: usize,
+        origin: [usize; 2],
+        size: [usize; 2],
+    ) {
         let [wi, hi] = self.canvas;
+        let ([x0, y0], [x1, y1]) = (origin, [origin[0] + size[0], origin[1] + size[1]]);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let at = |x: usize, y: usize| ((y - y0) * size[0] + x - x0) * stride;
         if WATER.load(Ordering::Relaxed) {
             // watercolour alone has no relief to light: the paper, with the kit's grain
             let mut s: u64 = 5;
@@ -931,14 +984,18 @@ impl Painting {
                 s = (s * 16807) % 2_147_483_647;
                 s as f32 / 2_147_483_647.0
             };
-            for i in 0..wi * hi {
+            for i in 0..(y1 - 1) * wi + x1 {
                 // (the grain is drawn for every pixel, so it stays where it is whatever is painted)
                 let g = if rnd() < 0.55 { 1.0 - rnd() * rnd() * 34.0 / 255.0 } else { 1.0 };
+                let (x, y) = (i % wi, i / wi);
+                if x < x0 || x >= x1 || y < y0 {
+                    continue;
+                }
                 let Some(c) = col(i) else {
                     continue;
                 };
                 for k in 0..3 {
-                    out[i * stride + k] = ((c[k] * g).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    out[at(x, y) + k] = ((c[k] * g).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
             return;
@@ -953,28 +1010,31 @@ impl Painting {
             let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             [v[0] / n, v[1] / n, v[2] / n]
         };
-        // wet paint settles: soften the relief a little before lighting it
-        let mut soft = vec![0.0f32; wi * hi];
-        for y in 0..hi {
-            for x in 0..wi {
+        // wet paint settles: soften the relief a little before lighting it (the light reads it a pixel round the
+        // rectangle, the canvas's edge clamping it)
+        let ([sx0, sy0], [sx1, sy1]) = ([x0.saturating_sub(1), y0.saturating_sub(1)], [(x1 + 1).min(wi), (y1 + 1).min(hi)]);
+        let sw = sx1 - sx0;
+        let mut soft = vec![0.0f32; sw * (sy1 - sy0)];
+        for y in sy0..sy1 {
+            for x in sx0..sx1 {
                 let mut acc = 0.0;
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
                         acc += self.thick[(y as i32 + dy).clamp(0, hi as i32 - 1) as usize * wi + (x as i32 + dx).clamp(0, wi as i32 - 1) as usize];
                     }
                 }
-                soft[y * wi + x] = acc / 9.0;
+                soft[(y - sy0) * sw + x - sx0] = acc / 9.0;
             }
         }
         let hgt = |x: usize, y: usize| -> f32 {
-            let (xf, yf) = (x as f32, y as f32);
+            let (xf, yf) = ((x + self.origin[0]) as f32, (y + self.origin[1]) as f32);
             let weave = 0.02 * ((xf * 1.55).sin() * (yf * 1.55).sin());
-            let i = y.min(hi - 1) * wi + x.min(wi - 1);
-            let t = soft[i];
-            t + weave * (1.0 - t).clamp(0.15, 1.0) * under(i)
+            let (x, y) = (x.min(wi - 1), y.min(hi - 1));
+            let t = soft[(y - sy0) * sw + x - sx0];
+            t + weave * (1.0 - t).clamp(0.15, 1.0) * under(y * wi + x)
         };
-        for y in 0..hi {
-            for x in 0..wi {
+        for y in y0..y1 {
+            for x in x0..x1 {
                 let Some(c) = col(y * wi + x) else {
                     continue;
                 };
@@ -989,7 +1049,7 @@ impl Painting {
                 let grey = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
                 for k in 0..3 {
                     let v = (grey + (c[k] - grey) * 1.2) * shade + spec.max(0.0) * 0.30 * BODY;
-                    out[(y * wi + x) * stride + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    out[at(x, y) + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
         }
@@ -2224,6 +2284,164 @@ fn hand_paths(pts: &[[f32; 2]], closed: bool, width: f32, offset: f32, seed: u32
     out
 }
 
+/// One straight piece of a path, from point `i` to point `i + 1`, as a sweep lays it: its ends, its length and how
+/// far along the path it starts.
+#[derive(Clone, Copy)]
+struct Piece {
+    i: usize,
+    a: [f32; 2],
+    b: [f32; 2],
+    l: f32,
+    walked: f32,
+}
+
+/// A path's whole length and the pieces a sweep lays along it, in order (a piece shorter than 0.05 px is not laid,
+/// and takes no length).
+fn pieces(path: &[[f32; 2]]) -> (f32, impl Iterator<Item = Piece> + '_) {
+    let total: f32 = path.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+    let mut walked = 0.0;
+    let laid = path.windows(2).enumerate().filter_map(move |(i, w)| {
+        let (a, b) = (w[0], w[1]);
+        let l = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if l < 0.05 {
+            return None;
+        }
+        let piece = Piece { i, a, b, l, walked };
+        walked += l;
+        Some(piece)
+    });
+    (total, laid)
+}
+
+/// A broad nib held at one angle, as a flat brush's chisel or a calligrapher's pen is: drawn across its edge it
+/// makes its full width, drawn along it only its edge, so one sweep runs thin along some directions and wide along
+/// others.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Nib {
+    /// How wide the nib is, in pixels.
+    pub width: f32,
+    /// The angle it is held at, in radians (as `Stroke::angle`: 0 along +x, y down).
+    pub angle: f32,
+    /// The thinnest mark it makes (drawn along its own edge), as a share of its width: 0 to 1.
+    pub edge: f32,
+}
+
+impl Nib {
+    /// How wide a mark the nib makes drawn at angle `dir` (radians): `width * |sin(dir - angle)|`, never less than
+    /// `width * edge`.
+    pub fn mark(&self, dir: f32) -> f32 {
+        self.width * (dir - self.angle).sin().abs().max(self.edge)
+    }
+}
+
+/// How wide a sweep lays each piece of its path.
+#[derive(Clone, Copy)]
+pub enum Width<'a> {
+    /// The same width all the way.
+    Even(f32),
+    /// A width at each point of the path (one per point): each piece is as wide as the mean of its two ends.
+    Points(&'a [f32]),
+    /// A broad nib: each piece as wide as the mark the nib makes in the piece's direction (`Nib::mark`).
+    Nib(Nib),
+    /// Any other, piece by piece: the width of the piece from point `i` to point `i + 1`, drawn at angle `dir`
+    /// (radians). A nib whose pressure comes and goes: `Width::By(&|i, dir| nib.mark(dir) * press[i])`.
+    By(&'a dyn Fn(usize, f32) -> f32),
+}
+
+/// What the brush has picked up, which its paint is worked with as it goes (`Stroke::picked`).
+#[derive(Clone, Copy)]
+pub enum Picked<'a> {
+    /// What is under each piece where it lands, read from the canvas's plain picture (`Painting::flat`), as a
+    /// stroke on its own does (`Stroke::picked` None).
+    Under,
+    /// One colour all the way.
+    Same([f32; 3]),
+    /// A colour by how far along the whole stroke each piece's middle is (0 to 1): a brush that carries more of a
+    /// neighbour's wet paint the further it goes, say.
+    Along(&'a dyn Fn(f32) -> [f32; 3]),
+}
+
+/// One sweep of the brush along a path, for `sweep_path`: what a `Stroke` says, said once for all of it.
+#[derive(Clone, Copy)]
+pub struct Sweep<'a> {
+    pub tool: Tool,
+    pub width: Width<'a>,
+    pub col: [f32; 3],
+    /// A second colour some bristles carry (broken colour).
+    pub alt: [f32; 3],
+    pub picked: Picked<'a>,
+    pub opacity: f32,
+    /// How much wet paint the brush picks up from the canvas.
+    pub pickup: f32,
+    pub load: f32,
+    pub bend: f32,
+    /// The sweep's bristles: its pieces share them, so their marks run on unbroken from one piece to the next.
+    /// Two sweeps laid side by side want different ones.
+    pub ident: u32,
+    /// Which stretch of the whole stroke the path is, 0 to 1 along it. The whole, (0, 1), lands at the path's
+    /// start and lifts at its end; a stroke laid as several paths gives each its own stretch (with one `ident` and
+    /// each its `along`), so it lands once, at the start of the first, and lifts once, at the end of the last.
+    pub span: (f32, f32),
+    /// How far along the whole stroke the path starts, in pixels (0 for the whole).
+    pub along: f32,
+}
+
+impl<'a> Sweep<'a> {
+    /// A whole stroke of `tool` in `col`, `width` wide, with bristles `ident`: opaque, a clean brush (no broken
+    /// colour, nothing picked up), a load of 1, no bend. Set the rest with `Sweep { load: 1.4, ..Sweep::new(..) }`.
+    pub fn new(tool: Tool, width: Width<'a>, col: [f32; 3], ident: u32) -> Sweep<'a> {
+        Sweep { tool, width, col, alt: col, picked: Picked::Same(col), opacity: 1.0, pickup: 0.0, load: 1.0, bend: 0.0, ident, span: (0.0, 1.0), along: 0.0 }
+    }
+}
+
+/// One sweep of the brush along `path` (canvas pixels), as the strokes to lay, in order, with `Painting::stroke`: a
+/// piece from each point to the next (none for one shorter than 0.05 px), all sharing the sweep's bristles and each
+/// knowing where along the whole stroke it is. So the brush lands once, at the start, its bristles touching down
+/// one by one; its paint thins and runs dry the further it goes; it lifts once, at the end; and the bristles' marks
+/// run unbroken through the joins. Sample the path finer where it turns and coarser where it runs straight: a join
+/// is where two pieces overlap a little (each runs on 0.06 of its width past either end), and a piece is straight.
+/// The strokes depend only on the path and the sweep, never on the canvas, so a sweep paints the same anywhere.
+pub fn sweep_path(path: &[[f32; 2]], s: &Sweep) -> Vec<Stroke> {
+    let (total, laid) = pieces(path);
+    let laid: Vec<Piece> = laid.collect();
+    let (s0, k) = (s.span.0, s.span.1 - s.span.0);
+    let last = laid.len().saturating_sub(1);
+    laid.iter()
+        .enumerate()
+        .map(|(j, &Piece { i, a, b, l, walked })| {
+            let angle = (b[1] - a[1]).atan2(b[0] - a[0]);
+            let width = match s.width {
+                Width::Even(w) => w,
+                Width::Points(w) => (w[i] + w[i + 1]) * 0.5,
+                Width::Nib(nib) => nib.mark(angle),
+                Width::By(f) => f(i, angle),
+            };
+            let mid = walked + l / 2.0;
+            Stroke {
+                tool: s.tool,
+                picked: match s.picked {
+                    Picked::Under => None,
+                    Picked::Same(c) => Some(c),
+                    Picked::Along(f) => Some(f(s0 + k * (mid / total))),
+                },
+                along: s.along + mid,
+                c: [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0],
+                angle,
+                len: l + width * 0.12,
+                width,
+                bend: s.bend,
+                col: s.col,
+                alt: s.alt,
+                opacity: s.opacity,
+                pickup: s.pickup,
+                load: s.load,
+                part: Some((s.ident, j == 0 && s.span.0 <= 0.0, j == last && s.span.1 >= 1.0)),
+                span: (s0 + k * (walked / total), s0 + k * ((walked + l) / total)),
+            }
+        })
+        .collect()
+}
+
 /// How strongly a sweep lays each piece of its path: given the canvas, the piece's middle and its direction.
 type SweepWeight<'a> = dyn Fn(&Painting, [f32; 2], [f32; 2]) -> f32 + 'a;
 
@@ -2242,7 +2460,7 @@ fn sweep(
     seed: u32,
     weight: &SweepWeight<'_>,
 ) {
-    let total: f32 = path.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+    let (total, laid) = pieces(path);
     if total < 1.0 {
         return;
     }
@@ -2258,13 +2476,7 @@ fn sweep(
         );
     }
     let picked = flat_under_sized(&p.flat, path[0][0], path[0][1], width * 0.3, p.canvas);
-    let mut walked = 0.0;
-    for (i, w) in path.windows(2).enumerate() {
-        let (a, b) = (w[0], w[1]);
-        let l = (b[0] - a[0]).hypot(b[1] - a[1]);
-        if l < 0.05 {
-            continue;
-        }
+    for Piece { i, a, b, l, walked } in laid {
         let state = weight(p, [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], [(b[0] - a[0]) / l, (b[1] - a[1]) / l]);
         if state > 0.04 {
             p.stroke(
@@ -2288,7 +2500,6 @@ fn sweep(
                 None,
             );
         }
-        walked += l;
     }
 }
 
@@ -5629,5 +5840,223 @@ mod tests {
         }
         assert!(worst <= 1, "the layer changed with the ground under it, by {worst} levels");
         assert!(opaque > 2000, "only {opaque} fully covered pixels");
+    }
+
+    /// A ribbon's stripe: a flat run low, an S rising 120 px, a flat run high, sampled finer through the S (canvas
+    /// pixels, on a 1/64 px grid so it can be moved by whole pixels exactly).
+    fn ribbon_path(dx: f32, dy: f32) -> Vec<[f32; 2]> {
+        let mut pts = vec![];
+        let mut x = -40.0f32;
+        while x <= 900.0 {
+            let t = ((x - 380.0) / 160.0).clamp(0.0, 1.0);
+            let y = 170.0 - 120.0 * t * t * t * (t * (6.0 * t - 15.0) + 10.0);
+            pts.push([x + dx, (y * 64.0).round() / 64.0 + dy]);
+            x += if (330.0..=590.0).contains(&x) { 2.0 } else { 10.0 };
+        }
+        pts
+    }
+    const NIB: Nib = Nib { width: 27.0, angle: 0.349_065_8, edge: 0.3 };
+    /// The bits of everything a stroke says, to compare two exactly.
+    fn bits(s: &Stroke) -> Vec<u32> {
+        let mut v = vec![s.tool as u32, s.along.to_bits(), s.angle.to_bits(), s.len.to_bits(), s.width.to_bits(), s.bend.to_bits()];
+        v.extend(s.c.iter().chain(&s.col).chain(&s.alt).chain(s.picked.iter().flatten()).map(|f| f.to_bits()));
+        v.extend([s.opacity, s.pickup, s.load, s.span.0, s.span.1].map(f32::to_bits));
+        let (id, lands, lifts) = s.part.unwrap_or_default();
+        v.extend([id, lands as u32, lifts as u32, s.picked.is_some() as u32]);
+        v
+    }
+
+    #[test]
+    fn a_sweep_along_a_ribbon_is_one_stroke_in_pieces() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let path = ribbon_path(0.0, 0.0);
+        let (terracotta, marigold) = ([0.85, 0.33, 0.18], [0.94, 0.66, 0.23]);
+        // the brush drags more of its neighbour's wet paint as it goes
+        let dragged = |t: f32| std::array::from_fn(|k| terracotta[k] + (marigold[k] - terracotta[k]) * 0.3 * t);
+        let sweep = Sweep { load: 1.35, pickup: 1.6, picked: Picked::Along(&dragged), ..Sweep::new(Tool::Flat, Width::Nib(NIB), terracotta, 0x51A7) };
+        let strokes = sweep_path(&path, &sweep);
+        assert_eq!(strokes.len(), path.len() - 1, "a piece from each point to the next");
+        // one stroke: its pieces share its bristles, run end to end along it, and it lands once and lifts once
+        for (j, (s, w)) in strokes.iter().zip(path.windows(2)).enumerate() {
+            assert_eq!(s.c, [(w[0][0] + w[1][0]) / 2.0, (w[0][1] + w[1][1]) / 2.0]);
+            assert_eq!(s.part, Some((0x51A7, j == 0, j == strokes.len() - 1)));
+            assert_eq!(s.width, NIB.mark(s.angle));
+            assert!(s.len > s.width * 0.12 && s.load == 1.35 && s.pickup == 1.6 && s.col == terracotta);
+            if j > 0 {
+                let before = &strokes[j - 1];
+                assert_eq!(s.span.0, before.span.1);
+                assert!(s.along > before.along && s.picked.unwrap()[1] >= before.picked.unwrap()[1]);
+            }
+        }
+        assert_eq!((strokes[0].span.0, strokes[strokes.len() - 1].span.1), (0.0, 1.0));
+        // the nib at 20 degrees: thin along the flats, wide through the S
+        let flat = strokes[0].width;
+        let widest = strokes.iter().map(|s| s.width).fold(0.0, f32::max);
+        assert!((flat - 27.0 * 0.342).abs() < 0.01 && widest > 2.5 * flat, "flat {flat}, widest {widest}");
+        // and it paints the path, solidly, and nothing far from it
+        let mut p = Painting::with_size(960, 220, CREAM);
+        p.keep_coverage();
+        for s in &strokes {
+            p.stroke(s, None);
+        }
+        let cv = p.coverage().unwrap();
+        for q in path.iter().filter(|q| (40.0..820.0).contains(&q[0])) {
+            let (x, y) = (q[0] as usize, q[1].round() as usize);
+            assert!(cv[y * 960 + x] > 0.9, "the stripe is thin at ({x}, {y}): {}", cv[y * 960 + x]);
+            for far in [y - 40, y + 40] {
+                assert_eq!(cv[far * 960 + x], 0.0, "paint at ({x}, {far}), far from the stripe");
+            }
+        }
+        let opaque = p.layer_rgba().unwrap().chunks(4).filter(|px| px[3] == 255).count();
+        assert!(opaque > 5000, "only {opaque} opaque pixels");
+    }
+
+    #[test]
+    fn a_nib_is_wide_across_its_edge_and_thin_along_it() {
+        let nib = Nib { width: 20.0, angle: 0.35, edge: 0.25 };
+        let half_pi = std::f32::consts::FRAC_PI_2;
+        assert!((nib.mark(nib.angle + half_pi) - 20.0).abs() < 1e-4 && (nib.mark(nib.angle - half_pi) - 20.0).abs() < 1e-4);
+        // along its own edge, either way, only the edge's breadth
+        assert_eq!((nib.mark(nib.angle), nib.mark(nib.angle + std::f32::consts::PI)), (5.0, 5.0));
+        // 30 degrees off the edge: half its width; the same either side
+        assert!((nib.mark(nib.angle + std::f32::consts::FRAC_PI_6) - 10.0).abs() < 1e-4);
+        for d in [0.1f32, 0.7, 1.2, 2.9] {
+            assert!((nib.mark(nib.angle + d) - nib.mark(nib.angle - d)).abs() < 1e-4);
+            assert!((nib.mark(nib.angle + d) - 20.0 * d.sin().abs().max(0.25)).abs() < 1e-4);
+        }
+        // every way of giving a sweep its width
+        let path = ribbon_path(0.0, 0.0);
+        let ws: Vec<f32> = (0..path.len()).map(|i| 8.0 + (i % 7) as f32).collect();
+        let press = |i: usize| 0.8 + 0.05 * (i % 9) as f32;
+        let by = |i: usize, dir: f32| nib.mark(dir) * press(i);
+        for (width, want) in [
+            (Width::Even(12.0), &(|_: usize, _: f32| 12.0f32) as &dyn Fn(usize, f32) -> f32),
+            (Width::Points(&ws), &|i: usize, _: f32| (ws[i] + ws[i + 1]) * 0.5),
+            (Width::Nib(nib), &|_: usize, dir: f32| nib.mark(dir)),
+            (Width::By(&by), &by),
+        ] {
+            for (i, s) in sweep_path(&path, &Sweep::new(Tool::Flat, width, [0.5; 3], 1)).iter().enumerate() {
+                assert_eq!(s.width, want(i, s.angle), "piece {i}");
+                assert_eq!(s.len, (path[i + 1][0] - path[i][0]).hypot(path[i + 1][1] - path[i][1]) + s.width * 0.12);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sweep_paints_the_same_every_time_and_anywhere() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let press: Vec<f32> = (0..200).map(|i| 1.0 + 0.2 * ((i as f32) * 0.37).sin()).collect();
+        let width = |i: usize, dir: f32| NIB.mark(dir) * (press[i] + press[i + 1]) * 0.5;
+        let sweep = Sweep { alt: [0.99, 0.8, 0.42], pickup: 1.2, load: 1.2, ..Sweep::new(Tool::Filbert, Width::By(&width), [0.94, 0.66, 0.23], 7) };
+        let paint = |dx: f32, dy: f32| {
+            let strokes = sweep_path(&ribbon_path(dx, dy), &sweep);
+            let mut p = Painting::with_size(1100, 300, CREAM);
+            p.keep_coverage();
+            for s in &strokes {
+                p.stroke(s, None);
+            }
+            (strokes, p)
+        };
+        let ((a, pa), (b, pb)) = (paint(0.0, 0.0), paint(0.0, 0.0));
+        assert!(a.iter().map(bits).eq(b.iter().map(bits)), "the same sweep gave different strokes");
+        assert!(pa.col == pb.col && pa.thick == pb.thick && pa.layer_rgba() == pb.layer_rgba(), "the same strokes painted differently");
+        // moved by whole pixels, it is the same strokes moved, and lays the same paint there
+        let (dx, dy) = (93, 41);
+        let (moved, pm) = paint(dx as f32, dy as f32);
+        for (s, m) in a.iter().zip(&moved) {
+            assert_eq!(bits(&Stroke { c: [s.c[0] + dx as f32, s.c[1] + dy as f32], ..*s }), bits(m));
+        }
+        let (cv, cm) = (pa.coverage().unwrap(), pm.coverage().unwrap());
+        for y in 0..300 - dy {
+            for x in 0..1100 - dx {
+                let (i, j) = (y * 1100 + x, (y + dy) * 1100 + x + dx);
+                assert!(pa.col[i] == pm.col[j] && pa.thick[i] == pm.thick[j] && cv[i] == cm[j], "moved, it painted ({x}, {y}) differently");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stroke_laid_as_two_paths_is_the_one_stroke() {
+        let path = ribbon_path(0.0, 0.0);
+        let whole = sweep_path(&path, &Sweep::new(Tool::Flat, Width::Nib(NIB), [0.2, 0.5, 0.53], 3));
+        let m = path.len() / 3;
+        let total: f32 = path.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+        let first: f32 = path[..=m].windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+        let t = first / total;
+        let base = Sweep::new(Tool::Flat, Width::Nib(NIB), [0.2, 0.5, 0.53], 3);
+        let mut halves = sweep_path(&path[..=m], &Sweep { span: (0.0, t), ..base });
+        halves.extend(sweep_path(&path[m..], &Sweep { span: (t, 1.0), along: first, ..base }));
+        assert_eq!(halves.len(), whole.len());
+        for (j, (h, w)) in halves.iter().zip(&whole).enumerate() {
+            assert_eq!((h.c, h.angle, h.width, h.part), (w.c, w.angle, w.width, w.part), "piece {j}");
+            assert!((h.along - w.along).abs() < 1e-2 && (h.span.0 - w.span.0).abs() < 1e-5 && (h.span.1 - w.span.1).abs() < 1e-5, "piece {j}");
+        }
+    }
+
+    #[test]
+    fn a_layer_lifted_a_rectangle_at_a_time_is_the_whole_layer() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let (w, h) = (400, 240);
+        let mut p = Painting::with_size(w, h, CREAM);
+        assert!(p.layer_rgba_in([0, 0], [10, 10]).is_none());
+        p.keep_coverage();
+        p.view = 2.4;
+        for s in sample_strokes(0.0, 0.0) {
+            p.stroke(&s, None);
+        }
+        let whole = p.layer_rgba().unwrap();
+        for (o, sz) in [
+            ([0, 0], [w, h]),
+            ([0, 0], [1, 1]),
+            ([w - 1, h - 1], [1, 1]),
+            ([13, 7], [100, 50]),
+            ([350, 200], [50, 40]),
+            ([0, 100], [w, 1]),
+            ([217, 0], [3, h]),
+            ([5, 5], [0, 9]),
+        ] {
+            let part = p.layer_rgba_in(o, sz).unwrap();
+            assert_eq!(part.len(), sz[0] * sz[1] * 4);
+            for y in 0..sz[1] {
+                let at = ((o[1] + y) * w + o[0]) * 4;
+                assert!(part[y * sz[0] * 4..(y + 1) * sz[0] * 4] == whole[at..at + sz[0] * 4], "{o:?} {sz:?}: row {y} differs");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_onto_a_canvas_paints_and_lights_as_the_canvas_does_there() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let (w, h) = (400, 240);
+        let paint = |size: [usize; 2], origin: [usize; 2]| {
+            let mut p = Painting::with_size(size[0], size[1], CREAM).with_origin(origin);
+            p.keep_coverage();
+            p.view = 2.4;
+            for s in sample_strokes(-(origin[0] as f32), -(origin[1] as f32)) {
+                p.stroke(&s, None);
+            }
+            p
+        };
+        let whole = paint([w, h], [0, 0]);
+        assert_eq!(whole.origin(), [0, 0]);
+        let layer = whole.layer_rgba().unwrap();
+        for (o, sz) in [([96, 40], [200, 150]), ([131, 0], [57, h]), ([0, 77], [w, 90])] {
+            let win = paint(sz, o);
+            assert_eq!(win.origin(), o);
+            let part = win.layer_rgba().unwrap();
+            let (x0, x1) = (if o[0] == 0 { 0 } else { 2 }, if o[0] + sz[0] == w { sz[0] } else { sz[0] - 2 });
+            let (y0, y1) = (if o[1] == 0 { 0 } else { 2 }, if o[1] + sz[1] == h { sz[1] } else { sz[1] - 2 });
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (i, j) = (y * sz[0] + x, (y + o[1]) * w + x + o[0]);
+                    assert!(win.col[i] == whole.col[j] && win.thick[i] == whole.thick[j], "{o:?}: the window painted ({x}, {y}) differently");
+                    assert_eq!(part[i * 4..i * 4 + 4], layer[j * 4..j * 4 + 4], "{o:?}: the window lit ({x}, {y}) differently");
+                }
+            }
+        }
     }
 }

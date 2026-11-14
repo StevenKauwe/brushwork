@@ -109,6 +109,7 @@ fn new_canvas(canvas: [usize; 2]) -> Painting {
         planning_clip: None,
         view: 1.0,
         coverage: None,
+        origin: [0, 0],
     }
 }
 

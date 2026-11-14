@@ -72,7 +72,49 @@ The layer's relief is lit as `lit()` lights it, with the canvas weave only under
 transparent; where the paint covers the canvas completely its colour is exactly `lit()`'s. `stroke`, `lit`,
 `keep_coverage` and `layer_rgba` work at any size; the scene painters (`paint_frame`, `paint_body`, `brush_fill` and
 the rest, the photo painters) frame their shapes on 1920 x 1080 and want `new()`. Coverage is kept by the CPU's
-strokes (a painting recorded for the GPU does not keep it).
+strokes (a painting recorded for the GPU does not keep it). To show a painting as it is being painted, lift only what
+changed: `p.layer_rgba_in([x, y], [w, h])` is exactly that rectangle of `layer_rgba()`, for the price of lighting it.
+To paint only the part of a long strip that shows, make a canvas that size `.with_origin([x, y])` (where it sits on the
+strip) and lay the strokes that reach it, moved by `-x, -y`: it lights exactly as the whole strip does there, but for
+its outermost two pixels.
+
+### One sweep along a path
+
+A long stroke (a stripe, a ribbon, a signature) is one sweep of the brush laid as straight pieces that share its
+bristles, each knowing where along the whole stroke it is: the brush lands once, its paint thins and dries as it goes,
+it lifts once, and its marks run unbroken through the joins. `sweep_path` turns a path into those pieces, ready to
+lay; the width is even, given at each point, a broad nib's (wide across its edge, thin along it:
+`width * |sin(dir - angle)|`), or anything else piece by piece:
+
+```rust
+use brushwork::{Nib, Painting, Picked, Sweep, Tool, Width, sweep_path};
+
+let (terracotta, marigold) = ([0.85, 0.33, 0.18], [0.94, 0.66, 0.23]);
+// a stripe that runs low, rises 120 px through an S and runs on high (canvas pixels)
+let path: Vec<[f32; 2]> = (0..=300)
+    .map(|i| {
+        let x = i as f32 * 4.0;
+        let t = ((x - 380.0) / 160.0).clamp(0.0, 1.0);
+        [x, 170.0 - 120.0 * t * t * (3.0 - 2.0 * t)]
+    })
+    .collect();
+let nib = Nib { width: 27.0, angle: 20f32.to_radians(), edge: 0.3 }; // a flat held at 20 degrees
+// the brush carries more of its neighbour's wet paint the further it goes
+let drag = |t: f32| std::array::from_fn(|k| terracotta[k] + (marigold[k] - terracotta[k]) * 0.3 * t);
+let stripe = Sweep { load: 1.35, pickup: 1.6, picked: Picked::Along(&drag), ..Sweep::new(Tool::Flat, Width::Nib(nib), terracotta, 0x51A7) };
+
+let mut p = Painting::with_size(1200, 220, [1.0, 0.988, 0.969]);
+p.keep_coverage();
+for s in sweep_path(&path, &stripe) {
+    p.stroke(&s, None);
+}
+let rgba = p.layer_rgba().unwrap();
+```
+
+A nib whose pressure comes and goes is `Width::By(&|i, dir| nib.mark(dir) * press[i])`. The strokes depend only on the
+path and the sweep, never on the canvas, so the same sweep paints the same anywhere (moved by whole pixels, it lays the
+same paint, moved). A stroke laid as several paths gives each its stretch of the whole (`span`, and `along`), so it
+lands once and lifts once.
 
 ## Saying what a shape is, and the light it is in
 
