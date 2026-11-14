@@ -31,4 +31,4 @@ adapter (declined); to check the GPU path locally: `webcheck --browser chrome --
 
 ## Releasing
 Tag `vX.Y.Z` on a green main, then bump the pin in music-to-movie-magic (`studio/Cargo.toml`) and CrabScape
-(`crates/painter/Cargo.toml`). CrabScape needs its atlas repainted (`tools/paint-oil-crab.sh`) if pixels changed.
+(`crates/painter/Cargo.toml`). CrabScape needs its atlas repainted (`tools/paint-oil.sh`) if pixels changed.
