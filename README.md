@@ -53,6 +53,27 @@ A film's `main` usually hands its command line to `brushwork::run` (one frame: `
 `brushwork::run_clip` (a stretch: `oilclip <t0> <t1> <dir>`). `brushwork::run_photo_with` paints a photograph.
 `Painting`, `paint_body` and the p5.brush-style `brush_fill` / `brush_wash` / `brush_stroke` lay strokes directly.
 
+### A canvas of any size, and the paint as a layer
+
+`Painting::new()` is the film's canvas, 1920 x 1080 on a toned ground. For a strip, a tile or a sprite, make a canvas
+the size of what is painted (it is quicker to make and to light, and much smaller) and lift the paint off it as a
+straight-alpha layer to put over anything:
+
+```rust
+let mut p = Painting::with_size(1468, 220, [1.0, 0.988, 0.969]); // a strip on the page's colour
+p.keep_coverage();                                               // opt in: how much of each pixel the strokes cover
+for s in &strokes {
+    p.stroke(s, None);
+}
+let rgba: Vec<u8> = p.layer_rgba().unwrap(); // 1468 x 220 RGBA: the paint's own colour, alpha its coverage
+```
+
+The layer's relief is lit as `lit()` lights it, with the canvas weave only under paint, so bare canvas is fully
+transparent; where the paint covers the canvas completely its colour is exactly `lit()`'s. `stroke`, `lit`,
+`keep_coverage` and `layer_rgba` work at any size; the scene painters (`paint_frame`, `paint_body`, `brush_fill` and
+the rest, the photo painters) frame their shapes on 1920 x 1080 and want `new()`. Coverage is kept by the CPU's
+strokes (a painting recorded for the GPU does not keep it).
+
 ## Saying what a shape is, and the light it is in
 
 Unlabelled shapes are painted from what the painter can infer from their size, colour and place. A film can instead

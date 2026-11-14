@@ -160,7 +160,7 @@ fn softness(family: &str) -> f32 {
     }
 }
 
-/// The canvas: every painting is 1920 x 1080.
+/// The film's canvas: `Painting::new` and every frame are 1920 x 1080 (`Painting::with_size` makes others).
 pub const WI: usize = 1920;
 pub const HI: usize = 1080;
 /// The smallest brush, in pixels. Nothing in the picture is finer than this.
@@ -251,6 +251,15 @@ pub struct Painting {
     planning_clip: Option<PlanningClip>,
     /// The camera's zoom on the picture as a whole (the paint's relief is lit as if seen from that close).
     pub view: f32,
+    /// How much of each pixel the strokes cover, when kept (`keep_coverage`).
+    coverage: Option<Box<Coverage>>,
+}
+
+/// What `layer_rgba` lifts the paint off: the canvas as it stood when coverage began to be kept (one colour if it
+/// was all one), and how much of each pixel the strokes laid since cover (0 to 1, composited as their paint is).
+struct Coverage {
+    ground: Vec<[f32; 3]>,
+    a: Vec<f32>,
 }
 
 /// The painter's tools. Each job gets the one a painter would reach for.
@@ -378,7 +387,55 @@ impl Painting {
             rec: None,
             planning_clip: None,
             view: 1.0,
+            coverage: None,
         }
+    }
+
+    /// A blank canvas of any size, all one `ground` colour (0 to 1, as `col`): a strip, a tile, a sprite, laid
+    /// with strokes directly. `stroke`, `lit`, `keep_coverage` and `layer_rgba` work at any size; the scene
+    /// painters (`paint_frame`, `paint_body`, `brush_fill` and the rest, the photo painters) frame their shapes on
+    /// the film's 1920 x 1080 and want `new()`. Its memory is about 44 bytes a pixel, so a canvas the size of what
+    /// is painted is much quicker to make and light than the film's (2 million pixels, about 90 MB).
+    pub fn with_size(width: usize, height: usize, ground: [f32; 3]) -> Painting {
+        assert!(width > 0 && height > 0, "a canvas needs at least one pixel");
+        let col = vec![ground; width * height];
+        Painting {
+            canvas: [width, height],
+            fast_photo: false,
+            mix_cache: None,
+            dynamics: Dynamics::default(),
+            flat: col.clone(),
+            behind: col.clone(),
+            col,
+            thick: vec![0.0; width * height],
+            wet: vec![0.0; width * height],
+            strokes: 0,
+            rec: None,
+            planning_clip: None,
+            view: 1.0,
+            coverage: None,
+        }
+    }
+
+    /// The canvas's size in pixels, [width, height].
+    pub fn size(&self) -> [usize; 2] {
+        self.canvas
+    }
+
+    /// Keep a coverage channel from here on: how much of each pixel the strokes laid after this call cover, from
+    /// 0 (the canvas as it is now) to 1 (their paint), composited as their paint is. `layer_rgba` lifts that paint
+    /// off as a layer. Off by default: it costs 4 bytes a pixel (16 if the canvas is not all one colour now) and
+    /// changes nothing else; the painting's pixels are the same with it or without. CPU strokes only: a painting
+    /// recorded for the GPU does not keep it.
+    pub fn keep_coverage(&mut self) {
+        let g = self.col[0];
+        let ground = if self.col.iter().all(|c| *c == g) { vec![g] } else { self.col.clone() };
+        self.coverage = Some(Box::new(Coverage { ground, a: vec![0.0; self.col.len()] }));
+    }
+
+    /// How much of each pixel the strokes laid since `keep_coverage` cover (0 to 1, row by row), if it is kept.
+    pub fn coverage(&self) -> Option<&[f32]> {
+        self.coverage.as_ref().map(|c| &c.a[..])
     }
 
     /// The same canvas with its paint layers replaced (for tests).
@@ -399,6 +456,7 @@ impl Painting {
             rec: None,
             planning_clip: None,
             view: 1.0,
+            coverage: None,
         }
     }
 
@@ -744,6 +802,9 @@ impl Painting {
                 for k in 0..3 {
                     self.col[i][k] += (c[k] - self.col[i][k]) * cover;
                 }
+                if let Some(cv) = self.coverage.as_mut() {
+                    cv.a[i] += (1.0 - cv.a[i]) * cover;
+                }
                 // thickness: most where the loaded brush lands, least where it lifts; a new stroke flattens what it crosses
                 let lay = s.load * ((0.6 + 0.4 * r1) * ridge * (1.0 - 0.6 * whole) + lips * lip) * knife_k * size_k * ridge_k;
                 // the brush leaves ITS thickness: going over the same place twice in one sweep adds nothing
@@ -784,21 +845,22 @@ impl Painting {
             r.glaze_area(tint, anchor, dir, z, id, mode, mix, step, alt, a);
             return;
         }
+        let [wi, hi] = self.canvas;
         for my in 0..sz[1] {
             let y = my as i32 + o[1];
-            if y < 0 || y >= HI as i32 {
+            if y < 0 || y >= hi as i32 {
                 continue;
             }
             for mx in 0..sz[0] {
                 let x = mx as i32 + o[0];
                 let m = mask[my * sz[0] + mx];
-                if x < 0 || x >= WI as i32 || m <= 0.0 {
+                if x < 0 || x >= wi as i32 || m <= 0.0 {
                     continue;
                 }
                 let (gx, gy) = (x as f32 + 0.5 - anchor[0], y as f32 + 0.5 - anchor[1]);
                 let (gu, gv) = (gx * dir[1] + gy * dir[0], -gx * dir[0] + gy * dir[1]);
-                let th = self.thick[y as usize * WI + x as usize];
-                let c = &mut self.col[y as usize * WI + x as usize];
+                let th = self.thick[y as usize * wi + x as usize];
+                let c = &mut self.col[y as usize * wi + x as usize];
                 match layer {
                     Layer::Light(outer, a) => *c = light_on(*c, th, m, tint, outer, a),
                     Layer::Glaze => {
@@ -823,7 +885,45 @@ impl Painting {
 
     /// Light the paint's relief from the upper left and add the canvas weave where it is thin.
     pub fn lit(&self) -> Vec<u8> {
-        let mut out = vec![0u8; WI * HI * 3];
+        let mut out = vec![0u8; self.col.len() * 3];
+        self.light(|i| Some(self.col[i]), |_| 1.0, &mut out, 3);
+        out
+    }
+
+    /// The paint laid since `keep_coverage`, lifted off the canvas as a straight-alpha RGBA layer (8 bits a
+    /// channel, row by row, the canvas's size), to go over any background: its colour is the paint's own, unmixed
+    /// from the canvas it was laid on, its alpha the coverage, and its relief lit as `lit` lights it. The canvas
+    /// weave shows only under paint (in proportion to it), so bare canvas is fully transparent (0, 0, 0, 0); where
+    /// the paint covers the canvas completely the colour is exactly `lit`'s. None unless coverage is kept. Glazes,
+    /// shades and lights the scene painters lay over bare canvas are not part of the layer.
+    pub fn layer_rgba(&self) -> Option<Vec<u8>> {
+        let cv = self.coverage.as_ref()?;
+        let uniform = cv.ground.len() == 1;
+        let paint = |i: usize| {
+            let (a, c) = (cv.a[i], self.col[i]);
+            if a <= 0.0 {
+                // bare canvas: nothing to light (it stays 0, 0, 0, 0)
+                return None;
+            }
+            if a >= 1.0 {
+                return Some(c);
+            }
+            // the canvas is the ground mixed with the strokes' paint by their coverage: unmix it
+            let g = cv.ground[if uniform { 0 } else { i }];
+            Some(std::array::from_fn(|k| (g[k] + (c[k] - g[k]) / a).clamp(0.0, 1.0)))
+        };
+        let mut out = vec![0u8; self.col.len() * 4];
+        self.light(paint, |i| cv.a[i], &mut out, 4);
+        for (px, a) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cv.a) {
+            px[3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        Some(out)
+    }
+
+    /// `lit` for any colours: lights `col(i)` with the relief of the paint, its canvas weave scaled by `under(i)`,
+    /// into the first three channels of each `stride` bytes of `out` (a pixel whose colour is None is left alone).
+    fn light(&self, col: impl Fn(usize) -> Option<[f32; 3]>, under: impl Fn(usize) -> f32, out: &mut [u8], stride: usize) {
+        let [wi, hi] = self.canvas;
         if WATER.load(Ordering::Relaxed) {
             // watercolour alone has no relief to light: the paper, with the kit's grain
             let mut s: u64 = 5;
@@ -831,13 +931,17 @@ impl Painting {
                 s = (s * 16807) % 2_147_483_647;
                 s as f32 / 2_147_483_647.0
             };
-            for (i, c) in self.col.iter().enumerate() {
+            for i in 0..wi * hi {
+                // (the grain is drawn for every pixel, so it stays where it is whatever is painted)
                 let g = if rnd() < 0.55 { 1.0 - rnd() * rnd() * 34.0 / 255.0 } else { 1.0 };
+                let Some(c) = col(i) else {
+                    continue;
+                };
                 for k in 0..3 {
-                    out[i * 3 + k] = ((c[k] * g).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    out[i * stride + k] = ((c[k] * g).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
-            return out;
+            return;
         }
         let l = {
             let v = [-0.52f32, -0.62, 0.59];
@@ -850,26 +954,30 @@ impl Painting {
             [v[0] / n, v[1] / n, v[2] / n]
         };
         // wet paint settles: soften the relief a little before lighting it
-        let mut soft = vec![0.0f32; WI * HI];
-        for y in 0..HI {
-            for x in 0..WI {
+        let mut soft = vec![0.0f32; wi * hi];
+        for y in 0..hi {
+            for x in 0..wi {
                 let mut acc = 0.0;
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
-                        acc += self.thick[(y as i32 + dy).clamp(0, HI as i32 - 1) as usize * WI + (x as i32 + dx).clamp(0, WI as i32 - 1) as usize];
+                        acc += self.thick[(y as i32 + dy).clamp(0, hi as i32 - 1) as usize * wi + (x as i32 + dx).clamp(0, wi as i32 - 1) as usize];
                     }
                 }
-                soft[y * WI + x] = acc / 9.0;
+                soft[y * wi + x] = acc / 9.0;
             }
         }
         let hgt = |x: usize, y: usize| -> f32 {
             let (xf, yf) = (x as f32, y as f32);
             let weave = 0.02 * ((xf * 1.55).sin() * (yf * 1.55).sin());
-            let t = soft[y.min(HI - 1) * WI + x.min(WI - 1)];
-            t + weave * (1.0 - t).clamp(0.15, 1.0)
+            let i = y.min(hi - 1) * wi + x.min(wi - 1);
+            let t = soft[i];
+            t + weave * (1.0 - t).clamp(0.15, 1.0) * under(i)
         };
-        for y in 0..HI {
-            for x in 0..WI {
+        for y in 0..hi {
+            for x in 0..wi {
+                let Some(c) = col(y * wi + x) else {
+                    continue;
+                };
                 let gx = (hgt(x + 1, y) - hgt(x.saturating_sub(1), y)) * 1.9 * BODY * self.view;
                 let gy = (hgt(x, y + 1) - hgt(x, y.saturating_sub(1))) * 1.9 * BODY * self.view;
                 let inv = 1.0 / (gx * gx + gy * gy + 1.0).sqrt();
@@ -877,16 +985,14 @@ impl Painting {
                 let diff = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]) / l[2];
                 let spec = (n[0] * hv[0] + n[1] * hv[1] + n[2] * hv[2]).max(0.0).powf(26.0) - hv[2].powf(26.0);
                 let shade = 0.74 + 0.26 * diff;
-                let c = self.col[y * WI + x];
                 // a little richer, as varnished paint is
                 let grey = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
                 for k in 0..3 {
                     let v = (grey + (c[k] - grey) * 1.2) * shade + spec.max(0.0) * 0.30 * BODY;
-                    out[(y * WI + x) * 3 + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    out[(y * wi + x) * stride + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
         }
-        out
     }
 }
 
@@ -5335,5 +5441,193 @@ mod tests {
         let (a, a2, b) = (paint(clip_seed(5, 6)), paint(clip_seed(4, 6)), paint(clip_seed(6, 6)));
         assert_eq!(block_peak(&a, &a2, 360, 720), 0.0);
         assert!(block_peak(&a, &b, 360, 720) > 0.02, "a boil step must visibly repaint");
+    }
+
+    /// FNV-1a over bytes: a fixed fingerprint of a picture, the same on every machine.
+    fn fingerprint(bytes: impl IntoIterator<Item = u8>) -> u64 {
+        bytes.into_iter().fold(0xCBF2_9CE4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01B3))
+    }
+    /// A few strokes of every tool laid straight on the canvas: one sweep in pieces, a bent filbert, a round that
+    /// picks up what is under it, a knife.
+    fn sample_strokes(dx: f32, dy: f32) -> Vec<Stroke> {
+        let base = Stroke {
+            tool: Tool::Flat,
+            picked: None,
+            along: 0.0,
+            c: [0.0; 2],
+            angle: 0.0,
+            len: 60.0,
+            width: 26.0,
+            bend: 0.0,
+            col: [0.84, 0.33, 0.18],
+            alt: [0.94, 0.66, 0.23],
+            opacity: 1.0,
+            pickup: 1.0,
+            load: 1.0,
+            part: None,
+            span: (0.0, 1.0),
+        };
+        let mut out: Vec<Stroke> = (0..6)
+            .map(|i| Stroke {
+                c: [dx + 60.0 + 50.0 * i as f32, dy + 60.0 + 4.0 * i as f32],
+                angle: 0.08,
+                along: 50.0 * i as f32,
+                part: Some((0x51A7, i == 0, i == 5)),
+                span: (i as f32 / 6.0, (i + 1) as f32 / 6.0),
+                picked: Some([0.6, 0.5, 0.37]),
+                ..base
+            })
+            .collect();
+        out.push(Stroke {
+            tool: Tool::Filbert,
+            c: [dx + 200.0, dy + 120.0],
+            angle: 1.1,
+            len: 140.0,
+            width: 30.0,
+            bend: 0.2,
+            col: [0.18, 0.49, 0.53],
+            pickup: 1.6,
+            ..base
+        });
+        out.push(Stroke { tool: Tool::Round, c: [dx + 150.0, dy + 90.0], angle: -0.4, len: 120.0, width: 9.0, col: [0.95, 0.85, 0.6], opacity: 0.8, ..base });
+        out.push(Stroke { tool: Tool::Knife, c: [dx + 260.0, dy + 70.0], angle: 0.3, len: 70.0, width: 24.0, col: [0.97, 0.95, 0.9], load: 1.6, ..base });
+        out
+    }
+
+    #[test]
+    fn a_new_canvas_paints_as_it_always_has() {
+        // `Painting::new` stays 1920 x 1080 on its toned ground, and its strokes, light and frames are byte for
+        // byte what they were before paintings had a size of their own (fingerprints taken on 0.5.0).
+        let (ground, painted) = {
+            let _style = styled(Style::DEFAULT);
+            ZOOM.with(|z| z.set(1.0));
+            let mut p = Painting::new();
+            assert_eq!(p.size(), [WI, HI]);
+            assert_eq!(p.col.len(), WI * HI);
+            let ground = fingerprint(p.lit());
+            for s in sample_strokes(700.0, 400.0) {
+                p.stroke(&s, None);
+            }
+            (ground, fingerprint(p.lit()))
+        };
+        let frame = {
+            let _style = styled(Style { cast: &["owl"], ..Style::DEFAULT });
+            let film = Film::new("dusk", 1.0, vec![Shot::new(0.0, "dusk", dusk)], "/nonexistent/dusk/film");
+            fingerprint(paint_frame(&film, 0.0, 1))
+        };
+        assert_eq!((ground, painted, frame), (0x0632_F2CE_CEEE_F729, 0xEAD6_205C_404C_558E, 0x56A9_D30A_F46D_89CA));
+    }
+
+    const CREAM: [f32; 3] = [1.0, 252.0 / 255.0, 247.0 / 255.0];
+
+    #[test]
+    fn a_canvas_of_any_size_paints_what_the_films_canvas_paints_there() {
+        // The same strokes on a 400 x 240 canvas and on the film's canvas (on the same ground) lay the same paint,
+        // to the bit, where the small one reaches (one stroke runs off its right edge); its light is the same but
+        // for the last two rows and columns, which light the edge of the canvas there.
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let (w, h) = (400, 240);
+        let mut strokes = sample_strokes(0.0, 0.0);
+        strokes.push(Stroke { c: [390.0, 150.0], angle: 0.2, len: 90.0, ..strokes[0] });
+        let mut small = Painting::with_size(w, h, CREAM);
+        assert_eq!((small.size(), small.col.len()), ([w, h], w * h));
+        let mut big = Painting::new();
+        for v in [&mut big.col, &mut big.flat, &mut big.behind] {
+            v.fill(CREAM);
+        }
+        for s in &strokes {
+            small.stroke(s, None);
+            big.stroke(s, None);
+        }
+        let (ls, lb) = (small.lit(), big.lit());
+        let mut lit_px = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let (i, j) = (y * w + x, y * WI + x);
+                assert!(small.col[i] == big.col[j] && small.thick[i] == big.thick[j], "paint differs at ({x}, {y})");
+                if x + 2 < w && y + 2 < h {
+                    assert_eq!(ls[i * 3..i * 3 + 3], lb[j * 3..j * 3 + 3], "light differs at ({x}, {y})");
+                    lit_px += (small.thick[i] > 0.0) as usize;
+                }
+            }
+        }
+        assert!(lit_px > 5000, "the strokes must have painted something ({lit_px} pixels)");
+    }
+
+    #[test]
+    fn coverage_is_kept_only_when_asked_and_changes_nothing() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let paint = |keep: bool| {
+            let mut p = Painting::with_size(400, 240, CREAM);
+            assert!(p.coverage().is_none() && p.layer_rgba().is_none());
+            if keep {
+                p.keep_coverage();
+            }
+            for s in sample_strokes(0.0, 0.0) {
+                p.stroke(&s, None);
+            }
+            p
+        };
+        let (plain, kept) = (paint(false), paint(true));
+        assert!(plain.col == kept.col && plain.thick == kept.thick && plain.lit() == kept.lit(), "keeping coverage changed the painting");
+        let cv = kept.coverage().expect("coverage is kept");
+        assert!(cv.iter().all(|a| (0.0..=1.0).contains(a)));
+        for (i, a) in cv.iter().enumerate() {
+            // coverage is where the strokes laid paint, and only there
+            assert_eq!(*a > 0.0, kept.col[i] != CREAM || kept.thick[i] > 0.0, "coverage and paint disagree at pixel {i}");
+        }
+        assert!(cv.iter().filter(|a| **a >= 1.0).count() > 2000, "an opaque stroke covers the canvas fully");
+    }
+
+    #[test]
+    fn a_layer_is_the_paint_alone_whatever_it_was_laid_on() {
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let (w, h) = (400, 240);
+        // (the strokes say what they picked up, so the paint is the same on any ground)
+        let strokes: Vec<Stroke> = sample_strokes(0.0, 0.0).into_iter().map(|s| Stroke { picked: Some([0.5, 0.42, 0.3]), ..s }).collect();
+        let layer = |mut p: Painting| {
+            p.keep_coverage();
+            for s in &strokes {
+                p.stroke(s, None);
+            }
+            let rgba = p.layer_rgba().expect("coverage is kept");
+            (p, rgba)
+        };
+        // bare canvas is fully transparent
+        let mut bare = Painting::with_size(w, h, CREAM);
+        bare.keep_coverage();
+        assert!(bare.layer_rgba().unwrap().iter().all(|v| *v == 0));
+        let (cream, on_cream) = layer(Painting::with_size(w, h, CREAM));
+        let (_, on_dark) = layer(Painting::with_size(w, h, [0.12, 0.1, 0.16]));
+        // and on the film's toned ground, which is not one colour (its layer is cut to the small canvas's corner)
+        let (_, on_toned) = layer(Painting::new());
+        assert_eq!(on_cream.len(), w * h * 4);
+        let lit = cream.lit();
+        let (mut opaque, mut worst) = (0, 0u8);
+        for y in 0..h - 2 {
+            for x in 0..w - 2 {
+                let (i, j) = (y * w + x, y * WI + x);
+                let px = &on_cream[i * 4..i * 4 + 4];
+                for other in [&on_dark[i * 4..i * 4 + 4], &on_toned[j * 4..j * 4 + 4]] {
+                    assert_eq!(px[3], other[3], "alpha differs at ({x}, {y})");
+                    if px[3] > 0 {
+                        worst = worst.max((0..3).map(|k| px[k].abs_diff(other[k])).max().unwrap());
+                    }
+                }
+                // where the paint covers the canvas completely the layer is what `lit` shows
+                let cv = cream.coverage().unwrap();
+                let full = |x: usize, y: usize| cv[y * w + x] >= 1.0;
+                if x > 0 && y > 0 && full(x, y) && full(x - 1, y) && full(x + 1, y) && full(x, y - 1) && full(x, y + 1) {
+                    assert_eq!(px[..3], lit[i * 3..i * 3 + 3], "a fully covered pixel at ({x}, {y}) is not lit as `lit` lights it");
+                    assert_eq!(px[3], 255);
+                    opaque += 1;
+                }
+            }
+        }
+        assert!(worst <= 1, "the layer changed with the ground under it, by {worst} levels");
+        assert!(opaque > 2000, "only {opaque} fully covered pixels");
     }
 }
