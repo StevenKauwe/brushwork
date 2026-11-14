@@ -212,7 +212,7 @@ pub fn app_start() -> Result<(), JsValue> {
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d")?.ok_or("no 2d context")?.dyn_into()?;
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
-    let worker = Worker::new_with_options("./worker.js", &opts)?;
+    let worker = Worker::new_with_options(&format!("./worker.js{}", win.location().search().unwrap_or_default()), &opts)?;
     let force_cpu = win.location().search().unwrap_or_default().contains("backend=cpu");
     let app: Shared = Rc::new(RefCell::new(App {
         doc: doc.clone(),

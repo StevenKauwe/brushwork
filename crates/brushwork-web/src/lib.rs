@@ -8,3 +8,6 @@ pub mod app;
 pub mod scene;
 pub mod stabilize;
 pub mod worker;
+
+#[cfg(target_arch = "wasm32")]
+pub mod photo;

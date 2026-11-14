@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! tools/build-web.sh && cargo run -p webcheck -- [--dir dist | --url URL] [--browser webkit|chrome] [--phone] [--shot out.png]
-//!     [--webgpu] [--headed] [--no-draw] [--expect-backend gpu|cpu] [--compare]
+//!     [--photo] [--engine scalar|simd] [--webgpu] [--headed] [--no-draw] [--expect-backend gpu|cpu] [--compare]
 //! ```
 //!
 //! It serves `--dir` (default `dist`) on a local port, or opens `--url`, through WebDriver: `WebKitWebDriver` with
@@ -323,6 +323,41 @@ impl Drop for Browser {
     }
 }
 
+/// Exercise the actual photo worker, including cancelling and restarting it.
+fn check_photo(b: &Browser, url: &str, engine: &str, expected: Option<String>) -> Result<()> {
+    b.call("POST", "/url", Some(json!({"url":format!("{}photo.html?engine={engine}", url.trim_end_matches('/').to_string()+"/")})))?;
+    b.js("document.getElementById('paint').click(); document.getElementById('cancel').click(); return true;")?;
+    let cancelled = b.js("return document.getElementById('status').textContent;")?;
+    if !cancelled.as_str().unwrap_or("").contains("Cancelled") {
+        return Err("photo cancellation failed".into());
+    }
+    b.js("document.getElementById('paint').click(); return true;")?;
+    let t = Instant::now();
+    loop {
+        let state = b.js("return [document.body.dataset.state, document.getElementById('status').textContent];")?;
+        match state[0].as_str() {
+            Some("painted") => break,
+            Some("failed") => return Err(format!("photo painting failed: {}", state[1])),
+            _ => {}
+        }
+        if t.elapsed() > Duration::from_secs(240) {
+            return Err(format!("photo painting timed out: {state}"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let result=b.js("const c=document.getElementById('result'), d=c.getContext('2d').getImageData(0,0,c.width,c.height).data; const colors=new Set(); for(let i=0;i<d.length;i+=28)colors.add((d[i]<<16)|(d[i+1]<<8)|d[i+2]); return [document.body.dataset.backend,document.body.dataset.engine,colors.size,document.getElementById('status').textContent];")?;
+    println!("photo: {result}");
+    if result[1].as_str() != Some(engine) || result[2].as_u64().unwrap_or(0) < 500 {
+        return Err(format!("photo worker produced an invalid result: {result}"));
+    }
+    if let Some(expected) = expected
+        && result[0].as_str() != Some(expected.as_str())
+    {
+        return Err(format!("photo expected {expected}: {result}"));
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -337,6 +372,9 @@ fn run() -> Result<()> {
     };
     let webgpu = args.iter().any(|a| a == "--webgpu");
     let b = Browser::start(&kind, phone, webgpu, args.iter().any(|a| a == "--headed"))?;
+    if args.iter().any(|a| a == "--photo") {
+        return check_photo(&b, &url, &opt("--engine").unwrap_or_else(|| "scalar".into()), opt("--expect-backend"));
+    }
     b.painted(&url)?;
     let (found, label, shown, painted_by) = b.backend()?;
     println!("backend label: {label:?} (worker found {found:?}; the picture was painted on {painted_by:?})");

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Brushwork · Fast photo painter</title>
+<style>body{font:16px system-ui;background:#202925;color:#f1ead9;max-width:1100px;margin:30px auto;padding:0 20px}button,select,input{font:inherit;padding:8px;margin:5px}canvas{width:100%;height:auto;background:#151d19}label{display:inline-block}a{color:#e1bc71}#status{min-height:3em}p{line-height:1.5}.views{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:600px){.views{grid-template-columns:1fr}}</style>
+<h1>Fast photo painter</h1><p>The same fast oil painter used natively, running here through WebAssembly and WebGPU. Photos stay on your device. When WebGPU is unavailable, the worker uses the slower Detailed CPU painter and says so.</p>
+<input id="file" type="file" accept="image/*" aria-label="Choose a photo">
+<label>Paint resolution <select id="resolution"><option>270</option><option selected>540</option><option>720</option><option>1080</option></select></label>
+<label><input id="steady" type="checkbox">Steady stroke layout</label><label><input id="cpu" type="checkbox">Detailed CPU</label>
+<button id="paint">Paint</button><button id="cancel" disabled>Cancel</button><p id="status" role="status">Choose a photo or paint the sample.</p>
+<div class="views"><div>Source<canvas id="source" width="480" height="270"></canvas></div><div>Oil finish<canvas id="result" width="480" height="270"></canvas></div></div>
+<p>Higher resolution keeps finer detail and takes longer. Detailed CPU uses its full internal canvas. <a href="index.html">Shape painter</a> · <a href="https://github.com/StevenKauwe/brushwork">Source</a></p>
+<script type="module">
+const $=id=>document.getElementById(id), source=$('source'), ctx=source.getContext('2d');
+ctx.fillStyle='#647368';ctx.fillRect(0,0,480,270);ctx.fillStyle='#bc883d';ctx.beginPath();ctx.ellipse(240,135,110,85,0,0,7);ctx.fill();ctx.fillStyle='#f6ddb0';ctx.fillRect(215,75,16,110);ctx.fillStyle='#272b2a';ctx.fillRect(255,105,40,10);
+let worker,serial=0;
+function setBusy(b){$('paint').disabled=b;$('file').disabled=b;$('cancel').disabled=!b;document.body.dataset.state=b?'painting':'ready'}
+function connect(){worker=new Worker('photo-worker.js'+location.search,{type:'module'});worker.onmessage=({data})=>{if(data.id!==serial)return;setBusy(false);if(data.error){$('status').textContent=data.error;document.body.dataset.state='failed';return}const canvas=$('result');canvas.width=data.width;canvas.height=data.height;canvas.getContext('2d').putImageData(new ImageData(data.pixels,data.width,data.height),0,0);$('status').textContent=`${data.backend.toUpperCase()} · ${data.engine} WASM · ${(data.milliseconds/1000).toFixed(2)} s · ${data.detail}`;document.body.dataset.state='painted';document.body.dataset.backend=data.backend;document.body.dataset.engine=data.engine};worker.onerror=error=>{setBusy(false);$('status').textContent='Worker failed: '+error.message;document.body.dataset.state='failed'}}
+connect();$('cancel').onclick=()=>{serial++;worker.terminate();connect();setBusy(false);$('status').textContent='Cancelled. Source photo retained.'};
+$('file').onchange=async()=>{const file=$('file').files[0];if(!file)return;try{const im=await createImageBitmap(file);const s=Math.min(1,1920/im.width,1080/im.height);source.width=Math.max(1,Math.round(im.width*s));source.height=Math.max(1,Math.round(im.height*s));ctx.drawImage(im,0,0,source.width,source.height);im.close();$('status').textContent='Photo ready.'}catch(e){$('status').textContent='Could not load photo: '+e.message}};
+$('paint').onclick=()=>{setBusy(true);$('status').textContent='Painting in worker…';const image=ctx.getImageData(0,0,source.width,source.height);worker.postMessage({id:++serial,pixels:image.data,width:image.width,height:image.height,resolution:Number($('resolution').value),steady:$('steady').checked,cpu:$('cpu').checked||new URL(location.href).searchParams.get('backend')==='cpu'},[image.data.buffer])};
+</script></html>

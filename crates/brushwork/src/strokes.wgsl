@@ -11,8 +11,9 @@ struct Cmd {
     mask_off: u32, mask_ox: i32, mask_oy: i32, mask_w: u32, mask_h: u32,
     x0: i32, x1: i32, y0: i32, y1: i32,
     kind: u32,
+    clip_off: u32, clip_ox: i32, clip_oy: i32, clip_w: u32, clip_h: u32,
     pad0: u32, pad1: u32, pad2: u32, pad3: u32, pad4: u32, pad5: u32, pad6: u32, pad7: u32,
-    pad8: u32, pad9: u32, pad10: u32, pad11: u32, pad12: u32, pad13: u32, pad14: u32,
+    pad8: u32, pad9: u32,
 };
 
 @group(0) @binding(0) var<storage, read> cmds: array<Cmd>;
@@ -23,8 +24,8 @@ struct Cmd {
 @group(0) @binding(5) var<storage, read_write> col: array<f32>;
 @group(0) @binding(6) var<storage, read_write> thick: array<f32>;
 
-const WI: u32 = 1920u;
-const HI: u32 = 1080u;
+override WI: u32 = 1920u;
+override HI: u32 = 1080u;
 const PI: f32 = 3.14159265358979323846;
 const STEADY_PICKUP: f32 = 0.18;
 
@@ -64,20 +65,23 @@ fn smoothk(a: f32, b: f32, x: f32) -> f32 {
 
 // the shape mask's value at a pixel (-1 outside its box); masks are stored in 16 x 16 blocks: 0 all outside, 1 all
 // inside, n >= 2 the block's values at n - 2
-fn mask_at(s: Cmd, x: i32, y: i32) -> f32 {
-    let mx = x - s.mask_ox;
-    let my = y - s.mask_oy;
-    if (mx < 0 || my < 0 || u32(mx) >= s.mask_w || u32(my) >= s.mask_h) {
+fn region_at(off: u32, ox: i32, oy: i32, w: u32, h: u32, x: i32, y: i32) -> f32 {
+    let mx = x - ox;
+    let my = y - oy;
+    if (mx < 0 || my < 0 || u32(mx) >= w || u32(my) >= h) {
         return -1.0;
     }
-    let bw = (s.mask_w + 15u) / 16u;
-    let blk = masks[s.mask_off + (u32(my) / 16u) * bw + u32(mx) / 16u];
+    let bw = (w + 15u) / 16u;
+    let blk = masks[off + (u32(my) / 16u) * bw + u32(mx) / 16u];
     if (blk == 0u) {
         return 0.0;
     } else if (blk == 1u) {
         return 1.0;
     }
     return bitcast<f32>(masks[blk - 2u + (u32(my) % 16u) * 16u + u32(mx) % 16u]);
+}
+fn mask_at(s: Cmd, x: i32, y: i32) -> f32 {
+    return region_at(s.mask_off, s.mask_ox, s.mask_oy, s.mask_w, s.mask_h, x, y);
 }
 
 @compute @workgroup_size(16, 16)
@@ -95,6 +99,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
     let e1 = offsets[tile + 1u];
     for (var e = e0; e < e1; e = e + 1u) {
         let s = cmds[entries[e]];
+        // Geometric visibility is resolved once by the caller. Every semantic operation,
+        // including glazes and halos, obeys that region before touching paint or thickness.
+        if (s.clip_w > 0u && region_at(s.clip_off, s.clip_ox, s.clip_oy, s.clip_w, s.clip_h, x, y) <= 0.0) {
+            continue;
+        }
         if (s.kind == 1u) {
             // a full-frame glaze
             let k = s.opacity;

@@ -14,7 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # No extra CPU features: iPhone WebKit rejects relaxed SIMD.
+  # Baseline remains portable; build-web separately builds plain SIMD.
   RUSTFLAGS: ""
 
 jobs:
@@ -26,6 +26,10 @@ jobs:
       - name: Rust (the version, targets and components in rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test web/engine-loader.test.mjs
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: clippy (CPU only)
@@ -59,7 +63,9 @@ jobs:
           tool: wasm-bindgen@${{ steps.wb.outputs.version }},wasm-tools
       - run: tools/build-web.sh
       - name: No relaxed SIMD (iPhone WebKit rejects it)
-        run: wasm-tools validate --features=-relaxed-simd dist/brushwork_web_bg.wasm
+        run: |
+          wasm-tools validate --features=-simd,-relaxed-simd dist/brushwork_web_bg.wasm
+          wasm-tools validate --features=-relaxed-simd dist/brushwork_web_simd.wasm
       - name: WebKitGTK (the iPhone's engine), its WebDriver and a virtual display
         # The WebDriver package is webkitgtk-webdriver since Ubuntu 26.04 (webkit2gtk-driver before).
         run: |
@@ -72,6 +78,11 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --shot dist-shot-desktop.png
       - name: The page paints in WebKit (phone size, iPhone user agent)
         run: xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --phone --shot dist-shot-phone.png
+      - name: Photo worker cancels and paints on the CPU in WebKit (scalar and SIMD)
+        run: |
+          for engine in scalar simd; do
+            xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- target/release/webcheck --dir dist --browser webkit --photo --engine "$engine" --expect-backend cpu
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:

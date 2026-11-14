@@ -102,6 +102,76 @@ In a browser nothing may block waiting for the GPU, so there the backend is open
 and frames painted with `brushwork::paint_frame_async(...).await` (the canvas page does this in its Web Worker,
 compute only, no canvas). Natively `paint_frame` is unchanged.
 
+## Fast photo painting (native and browser)
+
+The fast photo painter developed for ShapeStage is now in the engine. It is an **opt-in approximation**:
+a small image proxy guides strokes, paths are simplified, pigment tables are reused, and blur/relief work is
+parallel on native CPUs. The GPU lays batches of strokes. The detailed photo painter, semantic shape renderer,
+and 0.5.0's openings, translucent materials and lighting remain available.
+
+With the `gpu` feature, `paint_photo_image_fast_async` runs on native wgpu (Metal, Vulkan or DX12 as available)
+and browser WebGPU. Native callers can also use the blocking `paint_photo_image_fast`,
+`paint_photo_image_steady`, or `paint_photo_image_fast_at_size` wrappers. No unsafe Rust is used in the engine;
+the GPU command layout is checked by `bytemuck` derives and a size assertion.
+
+```rust,ignore
+use brushwork::{Dynamics, FastPhotoOptions, FastPhotoResolution, PhotoOptions};
+let options = PhotoOptions { attention: false, ground_subject: true, ..Default::default() };
+brushwork::open_gpu().await?; // required in the browser; also works natively
+let painted = brushwork::paint_photo_image_fast_async(
+    input_rgb, &options, [0.5, 0.5, 0.34], Dynamics::default(), 1,
+    FastPhotoOptions { resolution: FastPhotoResolution::P720, steady: true, upscale: true },
+    &mut |phase, completed, total| Ok(()), // return Err to cancel between work units
+).await?;
+```
+
+Working canvases are 480×270, 960×540, 1280×720 and 1920×1080. Output is cropped to the input aspect ratio;
+portrait images are turned back upright. `upscale: false` prevents enlargement of a small source. Resolution
+changes the actual painting work, rather than just resizing the finished pixels. `steady` keeps a seeded stroke
+layout across photos; it does not track moving objects. `Dynamics` supplies per-painting stroke size, wetness,
+pickup, thickness, bristles, soft edges and contour controls. Neutral values retain the detailed painter's defaults.
+
+The async API returns GPU errors, including an explicit busy error for overlapping fast-photo calls on the same
+engine instance. Queue jobs in a worker. Native blocking wrappers serialize their calls. A browser worker can be
+terminated to cancel even CPU work; the demo's Cancel button does that and recreates the worker.
+`paint_photo_image` is the in-memory detailed CPU alternative, with a progress callback. It is slower and has a
+different stroke plan, so callers should label a fallback rather than implying the fast GPU path ran.
+
+**Browser demo:** [Fast photo painter](https://stevenkauwe.github.io/brushwork/photo.html).
+`brushwork-web` exports `paint_photo_rgba`, returning pixels, actual backend, fallback reason and elapsed time.
+Input is straight RGBA; output preserves the source alpha (it does not generate missing texture under transparent
+pixels). Run it in a Web Worker. Source photos stay on the device.
+
+`tools/build-web.sh` builds a portable scalar module and a separate **plain SIMD128** module. A tiny capability
+probe selects SIMD before importing the module, with scalar retry if initialization fails. `?engine=scalar` and
+`?engine=simd` allow testing either build. Neither uses relaxed SIMD. `?backend=cpu` forces the CPU photo fallback.
+This follows [BrowserTabICL's capability-first loading and asynchronous GPU pattern](https://github.com/StevenKauwe/tabicl-anywhere/tree/6290de3664520becce649c1ca8cf94f0c26ecbcf);
+its model kernels were not copied. SIMD accelerates suitable CPU loops; WebGPU accelerates stroke application.
+Stroke planning, image preparation, and final relief are still CPU work. Browser CPU loops run in the worker;
+they do not start a Rayon thread pool.
+
+On an M2 Max, the included synthetic native GPU test took 26/44/85/155 ms at 270p/540p/720p/1080p after device
+initialization. Chrome's 540p demo took approximately 160 ms using SIMD + real Apple WebGPU, versus 4.45 s for
+its detailed CPU fallback. These are single smoke-test timings on different stroke plans, not a general benchmark
+or an image-equivalence claim. Browser scalar and SIMD outputs were also exercised, along with cancel/retry.
+
+Validation:
+
+```sh
+cargo test --workspace --release --locked
+cargo test -p brushwork --release --features gpu fast_photo -- --include-ignored --test-threads=1
+OIL_TEST_BACKEND=gpu cargo test -p brushwork --release --features gpu -- --test-threads=2
+node --test web/engine-loader.test.mjs
+tools/build-web.sh
+# WebDriver/browser installed; --engine simd also exercises the SIMD build:
+target/release/webcheck --dir dist --photo --engine scalar --expect-backend cpu
+```
+
+CI checks CPU/GPU/wasm linting, portable and SIMD build validity (no relaxed SIMD), the shape page in desktop
+and phone WebKit, and cancellation/repainting in the photo worker with both WASM builds. GPU tests need actual
+hardware and are run separately. ShapeStage's frame scheduling, camera crop, paint-ahead cache, and editor UI
+remain application concerns; the reusable painter no longer needs its vendored copy to get these engine APIs.
+
 ## Steadiness, and how it is tested
 
 Everything about a stroke comes from the shape it belongs to and its place on that shape, never from list order, the

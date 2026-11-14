@@ -18,8 +18,15 @@
 // Per-channel and per-band loops index several arrays with the same counter and mirror the GPU kernel line for
 // line (strokes.wgsl); the painting functions take a painter's many knobs as plain arguments on purpose.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+#![forbid(unsafe_code)]
 
+#[cfg(feature = "gpu")]
+mod fast_photo;
 mod gpu;
+#[cfg(feature = "gpu")]
+pub use fast_photo::{FastPhotoOptions, FastPhotoResolution, paint_photo_image_fast_async, resize_photo_fast};
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+pub use fast_photo::{paint_photo_image_fast, paint_photo_image_fast_at_size, paint_photo_image_steady};
 
 use brushwork_paint::prelude::*;
 use brushwork_paint::{Item, Kind, Lighting, Role};
@@ -197,7 +204,33 @@ type UnderLeaf = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<f32>, [f32; 3]);
 /// A region `run_photo` found: its area in pixels, mean colour, mean texture and outline.
 type PhotoShape = (usize, [f32; 3], f32, Vec<[f32; 2]>);
 
+/// Per-painting controls. Neutral values preserve the upstream stroke plan and pixels.
+/// These are local to this canvas; editor jobs and CPU/GPU exports do not share state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dynamics {
+    pub stroke_scale: f32,
+    pub thickness: f32,
+    pub wetness: f32,
+    pub pickup: f32,
+    pub bristles: f32,
+    pub edge_softness: f32,
+    pub contour: f32,
+}
+impl Default for Dynamics {
+    fn default() -> Self {
+        Self { stroke_scale: 1., thickness: 1., wetness: 1., pickup: 1., bristles: 1., edge_softness: 1., contour: 1. }
+    }
+}
+type MixTable = [[[f32; 3]; 9]; 2];
+type MixCache = ([[f32; 3]; 3], MixTable);
+
+type PlanningClip = (std::sync::Arc<[f32]>, [i32; 2], [usize; 2]);
+
 pub struct Painting {
+    canvas: [usize; 2],
+    fast_photo: bool,
+    mix_cache: Option<MixCache>,
+    pub dynamics: Dynamics,
     pub col: Vec<[f32; 3]>,
     /// The picture in plain colour, shape by shape, with no brushwork. STEADINESS: a brush picks up "what is
     /// under it" from here, not from the painted canvas, whose exact state depends on every stroke before and
@@ -207,7 +240,7 @@ pub struct Painting {
     pub thick: Vec<f32>,
     /// How much of the plain picture is paint rather than the bare toned ground (0 to 1): a brush can only work
     /// wet paint into its own, never the canvas's ground.
-    wet: Vec<f32>,
+    pub wet: Vec<f32>,
     /// The plain picture as it was before the last shape painted over each point: what lies behind it (what an
     /// opening cut in that shape shows).
     behind: Vec<[f32; 3]>,
@@ -215,6 +248,7 @@ pub struct Painting {
     pub strokes: u32,
     /// With a recorder, strokes are planned and written down for the GPU instead of laid (see gpu.rs).
     rec: Option<Box<gpu::Recorder>>,
+    planning_clip: Option<PlanningClip>,
     /// The camera's zoom on the picture as a whole (the paint's relief is lit as if seen from that close).
     pub view: f32,
 }
@@ -265,7 +299,57 @@ impl Default for Painting {
     }
 }
 
+/// An opaque visible-region handle belonging to one recorded painting.
+#[derive(Clone, Copy)]
+pub struct RecordedClip(u32, [i32; 2], [usize; 2]);
+
 impl Painting {
+    /// The planner's flat paint must obey the same visibility as the GPU strokes.
+    pub fn use_planning_region(&mut self, mask: std::sync::Arc<[f32]>, origin: [i32; 2], size: [usize; 2]) {
+        assert!(size[0] > 0 && size[1] > 0 && mask.len() == size[0] * size[1]);
+        self.planning_clip = Some((mask, origin, size));
+    }
+    fn visible_at(&self, x: usize, y: usize) -> bool {
+        let Some((mask, origin, size)) = self.planning_clip.as_ref() else {
+            return true;
+        };
+        let (mx, my) = (x as i32 - origin[0], y as i32 - origin[1]);
+        if mx < 0 || my < 0 || mx as usize >= size[0] || my as usize >= size[1] {
+            return false;
+        }
+        let (mx, my) = (mx as usize, my as usize);
+        mask[my * size[0] + mx] > 0.
+    }
+    /// Number of queued GPU commands, or None for a CPU painting.
+    pub fn recorded_strokes(&self) -> Option<usize> {
+        self.rec.as_ref().map(|r| r.cmds.len())
+    }
+    /// Call after an observer supplies its source canvas and before recording strokes.
+    pub fn sync_recorded_ground(&mut self) {
+        if let Some(r) = self.rec.as_mut() {
+            r.ground.clone_from(&self.col);
+        }
+    }
+    /// Register a binary visibility region, keeping the full planning outline unchanged.
+    pub fn record_clip(&mut self, mask: &[f32], origin: [i32; 2], size: [usize; 2]) -> Option<RecordedClip> {
+        assert!(size[0] > 0 && size[1] > 0 && mask.len() == size[0] * size[1]);
+        self.rec.as_mut().map(|r| {
+            let (off, origin, size) = r.store_mask(mask, origin, size);
+            RecordedClip(off, origin, size)
+        })
+    }
+    /// Restrict the commands added since `start` to their resolved visible region.
+    pub fn clip_recorded_since(&mut self, start: usize, clip: RecordedClip) {
+        if let Some(r) = self.rec.as_mut() {
+            for c in &mut r.cmds[start..] {
+                c.clip_off = clip.0;
+                c.clip_ox = clip.1[0];
+                c.clip_oy = clip.1[1];
+                c.clip_w = clip.2[0] as u32;
+                c.clip_h = clip.2[1] as u32;
+            }
+        }
+    }
     /// A fresh canvas on the toned ground.
     pub fn new() -> Painting {
         // a warm toned ground
@@ -280,18 +364,63 @@ impl Painting {
                 };
             }
         }
-        Painting { flat: col.clone(), behind: col.clone(), col, thick: vec![0.0; WI * HI], wet: vec![0.0; WI * HI], strokes: 0, rec: None, view: 1.0 }
+        Painting {
+            canvas: [WI, HI],
+            fast_photo: false,
+            mix_cache: None,
+            dynamics: Dynamics::default(),
+            flat: col.clone(),
+            behind: col.clone(),
+            col,
+            thick: vec![0.0; WI * HI],
+            wet: vec![0.0; WI * HI],
+            strokes: 0,
+            rec: None,
+            planning_clip: None,
+            view: 1.0,
+        }
     }
 
     /// The same canvas with its paint layers replaced (for tests).
     #[cfg(test)]
     fn with_layers(col: Vec<[f32; 3]>, flat: Vec<[f32; 3]>, thick: Vec<f32>) -> Painting {
         let wet = vec![1.0; col.len()];
-        Painting { behind: flat.clone(), col, flat, thick, wet, strokes: 0, rec: None, view: 1.0 }
+        Painting {
+            canvas: [WI, HI],
+            fast_photo: false,
+            mix_cache: None,
+            dynamics: Dynamics::default(),
+            behind: flat.clone(),
+            col,
+            flat,
+            thick,
+            wet,
+            strokes: 0,
+            rec: None,
+            planning_clip: None,
+            view: 1.0,
+        }
     }
 
     /// One stroke. `mask` (with its origin and size) limits it softly to a shape.
     pub fn stroke(&mut self, s: &Stroke, mask: Option<(&[f32], [i32; 2], [usize; 2])>) {
+        let [width, height] = self.canvas;
+        let adjusted;
+        let s = if self.dynamics != Dynamics::default() {
+            adjusted = Stroke {
+                pickup: s.pickup * self.dynamics.pickup * self.dynamics.wetness,
+                load: s.load * self.dynamics.thickness,
+                alt: if self.dynamics.bristles == 1. {
+                    s.alt
+                } else {
+                    std::array::from_fn(|k| (s.col[k] + (s.alt[k] - s.col[k]) * self.dynamics.bristles).clamp(0., 1.))
+                },
+                ..*s
+            };
+            &adjusted
+        } else {
+            s
+        };
         self.strokes += 1;
         let (id, _lands, _lifts) = match s.part {
             Some((id, a, b)) => (id, a, b),
@@ -299,17 +428,17 @@ impl Painting {
         };
         let (sn, cs) = s.angle.sin_cos();
         let reach = s.len / 2.0 + s.width;
-        let (x0, x1) = (((s.c[0] - reach).floor() as i32).max(0), ((s.c[0] + reach).ceil() as i32).min(WI as i32 - 1));
-        let (y0, y1) = (((s.c[1] - reach).floor() as i32).max(0), ((s.c[1] + reach).ceil() as i32).min(HI as i32 - 1));
+        let (x0, x1) = (((s.c[0] - reach).floor() as i32).max(0), ((s.c[0] + reach).ceil() as i32).min(width as i32 - 1));
+        let (y0, y1) = (((s.c[1] - reach).floor() as i32).max(0), ((s.c[1] + reach).ceil() as i32).min(height as i32 - 1));
         if x0 > x1 || y0 > y1 {
             return;
         }
         // the paint already there, where the brush lands
         let start = [s.c[0] - cs * s.len * 0.4, s.c[1] - sn * s.len * 0.4];
         // a stroke that lands off the canvas has nothing to pick up (not whatever happens to be at the canvas edge)
-        let under = s.picked.unwrap_or_else(|| flat_under(&self.flat, start[0], start[1], s.width * 0.3));
-        let premix = PREMIX.with(|p| p.get());
-        let fade = FADE.with(|f| f.get());
+        let under = s.picked.unwrap_or_else(|| flat_under_sized(&self.flat, start[0], start[1], s.width * 0.3, self.canvas));
+        let premix = if self.fast_photo { 1. } else { PREMIX.with(|p| p.get()) };
+        let fade = if self.fast_photo { 1. } else { FADE.with(|f| f.get()) };
         if fade <= 0.0 {
             return;
         }
@@ -321,22 +450,43 @@ impl Painting {
         };
         // what the brush's two colours become with more and more of the picked-up paint worked into them: as
         // pigments (blue into yellow goes green and stays rich), worked out once per stroke
-        let pigment = PIGMENT.load(Ordering::Relaxed);
+        let pigment = self.fast_photo || PIGMENT.load(Ordering::Relaxed);
         let mut worked = [[[0.0f32; 3]; 9]; 2];
         if pigment {
-            let d = |c: [f32; 3]| [c[0] as f64, c[1] as f64, c[2] as f64];
-            let ku = brushwork_kit::spectral::ks(d(under));
-            for (w, own) in [s.col, s.alt].into_iter().enumerate() {
-                let ko = brushwork_kit::spectral::ks(d(own));
-                for (i, slot) in worked[w].iter_mut().enumerate() {
-                    let f = i as f64 / 8.0 * 0.85;
-                    let mixed: [f64; 38] = std::array::from_fn(|b| ko[b] * (1.0 - f) + ku[b] * f);
-                    let rgb = brushwork_kit::spectral::colour(&mixed).0;
-                    *slot = [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32];
+            let key = [s.col, s.alt, under];
+            if let Some((cached_key, table)) = &self.mix_cache
+                && *cached_key == key
+            {
+                worked = *table;
+            } else {
+                let d = |c: [f32; 3]| [c[0] as f64, c[1] as f64, c[2] as f64];
+                let ku = brushwork_kit::spectral::ks(d(under));
+                for (w, own) in [s.col, s.alt].into_iter().enumerate() {
+                    let ko = brushwork_kit::spectral::ks(d(own));
+                    for i in 0..9 {
+                        if self.fast_photo && i % 4 != 0 {
+                            continue;
+                        }
+                        let slot = &mut worked[w][i];
+                        let f = i as f64 / 8.0 * 0.85;
+                        let mixed: [f64; 38] = std::array::from_fn(|b| ko[b] * (1.0 - f) + ku[b] * f);
+                        let rgb = brushwork_kit::spectral::colour(&mixed).0;
+                        *slot = [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32];
+                    }
                 }
+                if self.fast_photo {
+                    for side in &mut worked {
+                        for i in [1usize, 2, 3, 5, 6, 7] {
+                            let lo = i / 4 * 4;
+                            let f = (i - lo) as f32 / 4.;
+                            side[i] = std::array::from_fn(|k| side[lo][k] + (side[lo + 4][k] - side[lo][k]) * f);
+                        }
+                    }
+                }
+                self.mix_cache = Some((key, worked));
             }
         }
-        let z = zoom();
+        let z = if self.fast_photo { 0.5 } else { zoom() };
         let nb = match s.tool {
             Tool::Flat => (s.width / z / 4.5).max(4.0),
             Tool::Filbert => (s.width / z / 5.5).max(3.0),
@@ -355,6 +505,8 @@ impl Painting {
             Tool::Round => (0.07 * BODY, 0.2 * BODY, (0.55 + 0.14 * s.width).min(1.4)),
             Tool::Knife => (0.0, 1.1 * BODY, 0.8),
         };
+        let marks = marks * self.dynamics.bristles;
+        let edge_soft = edge_soft * self.dynamics.edge_softness;
         // the whole stroke's length (a piece of a sweep knows its share of it), and how far in from its ends the
         // bristles touch down and lift off: about a brush width, less on a touch too short to have that much
         let whole_len = (s.len / (s.span.1 - s.span.0).max(1e-3)).max(1.0);
@@ -366,7 +518,7 @@ impl Painting {
         // fail the exact tests below anyway; the bounds carry a pixel of margin so rounding can't cut a pixel off.
         let half_max = s.width * 0.53 * (1.0 + 1e-4) + 1e-3;
         let (slant_k, slant_c) = ((hf(id, 991) - 0.5) * 1.7, (hf(id, 992) - 0.5) * 0.25);
-        let ridge_k = recipe().ridge;
+        let ridge_k = if self.fast_photo { STYLE[Band::Mid as usize].ridge } else { recipe().ridge };
         let size_k = (s.width / z / 40.0).clamp(0.3, 1.5);
         let knife_k = if s.tool == Tool::Knife { 1.6 } else { 1.0 };
         // how big the brush is, as a hand holds it (see `round` below)
@@ -374,7 +526,6 @@ impl Painting {
         let bristle =
             |b: i32| -> [f32; 5] { [hf(id, b as u32), hf(id ^ 0x55, b as u32), hf(id ^ 0xAA, b as u32), hf(id ^ 0x3C, b as u32), hf(id ^ 0x77, b as u32)] };
         let nbi = nb.ceil() as i32 + 2;
-        let bristles: Vec<[f32; 5]> = (-1..=nbi).map(bristle).collect();
         let along_max = s.len / 2.0 + 1.0;
         let side_max = half_max + s.bend.abs() * along_max * along_max / s.len + 1.0;
         // the x range (in pixels) where |a * dx + c| <= m, for dx = x + 0.5 - cx
@@ -476,10 +627,15 @@ impl Painting {
             rec.push(cmd, pigment.then_some(&worked), bands);
             return;
         }
+        let bristles: Vec<[f32; 5]> = (-1..=nbi).map(bristle).collect();
         for y in y0..=y1 {
             let dy = y as f32 + 0.5 - s.c[1];
-            let Some((ua, ub)) = span(cs, dy * sn, along_max) else { continue };
-            let Some((va, vb)) = span(-sn, dy * cs, side_max) else { continue };
+            let Some((ua, ub)) = span(cs, dy * sn, along_max) else {
+                continue;
+            };
+            let Some((va, vb)) = span(-sn, dy * cs, side_max) else {
+                continue;
+            };
             for x in ua.max(va)..=ub.min(vb) {
                 let dx = x as f32 + 0.5 - s.c[0];
                 let u = dx * cs + dy * sn;
@@ -489,6 +645,19 @@ impl Painting {
                 }
                 let v = -dx * sn + dy * cs - s.bend * (u * u) / s.len;
                 if v.abs() > half_max {
+                    continue;
+                }
+                let m_k = match mask {
+                    Some((m, o, sz)) => {
+                        let (mx, my) = (x - o[0], y - o[1]);
+                        if mx < 0 || my < 0 || mx as usize >= sz[0] || my as usize >= sz[1] {
+                            continue;
+                        }
+                        m[my as usize * sz[0] + mx as usize]
+                    }
+                    None => 1.0,
+                };
+                if m_k <= 0.0 {
                     continue;
                 }
                 // the brush's footprint: a little narrower where it lands and lifts, ragged at the sides
@@ -518,16 +687,6 @@ impl Painting {
                 let dry_at = 1.0 - ((0.30 + 0.85 * (1.0 - r1)) * end_w - slant + round).max(0.18 * end_w) / whole_len;
                 let landed = smooth(land_at, land_at + (0.25 + 0.35 * r2) * end_w / whole_len, whole);
                 let lift_k = 1.0 - smooth(dry_at - 0.10 * end_w / whole_len, dry_at + 0.12 * end_w / whole_len, whole);
-                let m_k = match mask {
-                    Some((m, o, sz)) => {
-                        let (mx, my) = (x - o[0], y - o[1]);
-                        if mx < 0 || my < 0 || mx as usize >= sz[0] || my as usize >= sz[1] {
-                            continue;
-                        }
-                        m[my as usize * sz[0] + mx as usize]
-                    }
-                    None => 1.0,
-                };
                 // SPEED: the coverage below is this product times more factors in [0, 1], so (rounding being
                 // monotonic) if this is already too little to lay, the full product is too: skip the rest
                 if landed * lift_k * m_k <= 0.004 {
@@ -565,7 +724,7 @@ impl Painting {
                 let streak = if r3 < 0.22 { 0.6 } else { 0.0 } * (0.5 + 0.5 * r4);
                 let pick = (s.pickup * STEADY_PICKUP * (0.4 + 1.2 * r2) * (0.5 + whole)).clamp(0.0, 0.85);
                 let tone = 1.0 + 0.07 * (r4 - 0.5) + 0.03 * lip;
-                let i = y as usize * WI + x as usize;
+                let i = y as usize * width + x as usize;
                 let mut c = [0.0f32; 3];
                 if pigment {
                     let at = pick / 0.85 * 8.0;
@@ -1303,16 +1462,19 @@ fn signed_depth(pts: &[[f32; 2]], q: [f32; 2], cap: f32) -> f32 {
 /// down with itself, laid at full strength, and a faint band cut by the frame grew a bright white tip, coming and
 /// going as the band moved across the edge.)
 fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32) -> [f32; 3] {
-    let r = r.clamp(1.0, HI as f32 * 0.45);
+    flat_under_sized(flat, x, y, r, [WI, HI])
+}
+fn flat_under_sized(flat: &[[f32; 3]], x: f32, y: f32, r: f32, [width, height]: [usize; 2]) -> [f32; 3] {
+    let r = r.clamp(1.0, height as f32 * 0.45);
     let bil = |x: f32, y: f32| -> [f32; 3] {
-        let (x, y) = (x.clamp(0.0, WI as f32 - 1.001), y.clamp(0.0, HI as f32 - 1.001));
+        let (x, y) = (x.clamp(0.0, width as f32 - 1.001), y.clamp(0.0, height as f32 - 1.001));
         let (x0, y0) = (x.floor() as usize, y.floor() as usize);
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-        let (a, b, c, d) = (flat[y0 * WI + x0], flat[y0 * WI + x0 + 1], flat[(y0 + 1) * WI + x0], flat[(y0 + 1) * WI + x0 + 1]);
+        let (a, b, c, d) = (flat[y0 * width + x0], flat[y0 * width + x0 + 1], flat[(y0 + 1) * width + x0], flat[(y0 + 1) * width + x0 + 1]);
         std::array::from_fn(|k| (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy)
     };
     // (the patch is moved in onto the canvas as a whole, so it never straddles the edge)
-    let (x, y) = (x.clamp(r, WI as f32 - 1.0 - r), y.clamp(r, HI as f32 - 1.0 - r));
+    let (x, y) = (x.clamp(r, width as f32 - 1.0 - r), y.clamp(r, height as f32 - 1.0 - r));
     let mut sum = [0.0f32; 3];
     for j in -1..=1 {
         for i in -1..=1 {
@@ -1445,19 +1607,25 @@ fn glaze(p: &mut Painting, c: [f32; 3], k: f32) {
         // GPU: the canvas is glazed there, in order with the strokes; the plain picture stays here
         r.glaze(c, k);
         for i in 0..WI * HI {
+            if !p.visible_at(i % WI, i / WI) {
+                continue;
+            }
             for q in 0..3 {
                 p.flat[i][q] += (c[q] - p.flat[i][q]) * k;
             }
-            p.wet[i] += (1.0 - p.wet[i]) * k;
+            p.wet[i] += (p.dynamics.wetness - p.wet[i]) * k;
         }
         return;
     }
     for i in 0..WI * HI {
+        if !p.visible_at(i % WI, i / WI) {
+            continue;
+        }
         for q in 0..3 {
             p.col[i][q] += (c[q] - p.col[i][q]) * k;
             p.flat[i][q] += (c[q] - p.flat[i][q]) * k;
         }
-        p.wet[i] += (1.0 - p.wet[i]) * k;
+        p.wet[i] += (p.dynamics.wetness - p.wet[i]) * k;
         p.thick[i] *= 1.0 - k;
     }
 }
@@ -1515,7 +1683,8 @@ fn paint_form_band(
     let thin_k = (1.0 - smooth(1.2 * SMALLEST * z, 2.5 * SMALLEST * z, thick)).max(mode.line);
     // The brush follows the shape's size continuously. (It used to snap to steps of 1.22x: a shape that swelled
     // across a step boundary, or a blinking eye, re-planned every stroke in it in one frame, which read as a pop.)
-    let width = (thick / z * 0.30 * detail).clamp(5.0, 110.0) * z;
+    // Keep the explicit stroke-size control effective even when a broad shape reaches the automatic brush cap.
+    let width = (thick / z * 0.30 * detail).clamp(5.0, 110.0) * z * p.dynamics.stroke_scale.clamp(0.25, 3.0);
     // How far back the shape sits (see `softness`). A shape that stands out strongly from the paint it is laid on
     // (a moon in the night sky, a light window in a dark wall) is an accent however far away it is, and is painted
     // as crisply and as lively as a subject.
@@ -1580,7 +1749,9 @@ fn paint_form_band(
         let glow = 0.7 * far * smooth(0.2, 0.45, lum(col) - lum(flat[i]));
         ((1.0 - smooth(lo_c, hi_c, contrast(col, flat[i]))) * (0.5 + 0.5 * wet[i])).max(glow)
     };
-    let Some((mask, o, sz)) = shape_mask_with(pts, grow.max(1.0), Some(&lost)) else { return };
+    let Some((mask, o, sz)) = shape_mask_with(pts, grow.max(1.0), Some(&lost)) else {
+        return;
+    };
     // the grid of strokes hangs on the shape's own centre, so it travels with the shape (and a big shape half off
     // the canvas keeps its strokes where they were)
     // A slot's identity is its lattice index (iu, iv) counted from the shape's own centroid, so it never depends
@@ -1684,7 +1855,7 @@ fn paint_form_band(
             let wet = wet_under(&p.wet, q[0], q[1], r);
             let under = flat_under(&p.flat, q[0], q[1], r);
             lost = 1.0 - smooth(0.05 + 0.06 * soft, 0.22 + 0.1 * soft, contrast(col, under));
-            let blend = edge_wet * wet * lost * (0.14 + 0.3 * soft) * (1.0 - mode.clean);
+            let blend = (edge_wet * wet * lost * (0.14 + 0.3 * soft) * (1.0 - mode.clean) * p.dynamics.pickup * p.dynamics.wetness).min(0.85);
             if blend > 0.004 {
                 own = pigment_mix(own, under, blend);
                 own_alt = pigment_mix(own_alt, under, blend);
@@ -1727,12 +1898,12 @@ fn paint_form_band(
         for x in 0..sz[0] {
             if mask[y * sz[0] + x] >= 0.5 {
                 let (px, py) = (x as i32 + o[0], y as i32 + o[1]);
-                if px >= 0 && py >= 0 && (px as usize) < WI && (py as usize) < HI {
+                if px >= 0 && py >= 0 && (px as usize) < WI && (py as usize) < HI && p.visible_at(px as usize, py as usize) {
                     let j = py as usize * WI + px as usize;
                     p.behind[j] = p.flat[j];
                     let f = &mut p.flat[j];
                     *f = std::array::from_fn(|k| f[k] + (col[k] - f[k]) * premix);
-                    p.wet[j] += (1.0 - p.wet[j]) * premix;
+                    p.wet[j] += (p.dynamics.wetness - p.wet[j]) * premix;
                 }
             }
         }
@@ -1980,7 +2151,7 @@ fn sweep(
             path[path.len() - 1][1]
         );
     }
-    let picked = flat_under(&p.flat, path[0][0], path[0][1], width * 0.3);
+    let picked = flat_under_sized(&p.flat, path[0][0], path[0][1], width * 0.3, p.canvas);
     let mut walked = 0.0;
     for (i, w) in path.windows(2).enumerate() {
         let (a, b) = (w[0], w[1]);
@@ -2018,6 +2189,10 @@ fn sweep(
 /// Cutting in: where a colour ends, the brush is drawn along the edge, just inside it.
 #[allow(clippy::too_many_arguments)]
 fn paint_contour(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3], width: f32, seed: u32, opacity: f32, body: f32, keep: f32, soft: f32) {
+    if p.dynamics.contour <= 0. {
+        return;
+    }
+    let opacity = (opacity * p.dynamics.contour).min(1.);
     for (path, share, ident) in hand_paths(pts, true, width, width * 0.42, seed, HAND_OUTLINE) {
         let id = seed ^ ident;
         sweep(
@@ -2085,7 +2260,9 @@ fn paint_cast_shadow(p: &mut Painting, pts: &[[f32; 2]], caster: Option<&[[f32; 
     };
     // (but never so wide that a narrow shadow dissolves: a painter keeps it readable)
     let pen = (((thick * 0.2 + ext * 0.05).min(90.0 * z) + 3.0 * z) * (0.4 + 0.6 * soft.max(0.6))).min(thick * 0.3 + 2.0 * z);
-    let Some((mut m, o, sz)) = blurred_cover(pts, pen) else { return };
+    let Some((mut m, o, sz)) = blurred_cover(pts, pen) else {
+        return;
+    };
     let reach = caster.map_or(1.0, |c| (thickness(c) * 1.2).max(30.0 * z));
     // how far each point is from what casts it, measured on a coarse grid and interpolated (it changes slowly)
     const G: usize = 4;
@@ -2134,7 +2311,7 @@ fn paint_cast_shadow(p: &mut Painting, pts: &[[f32; 2]], caster: Option<&[[f32; 
         for mx in 0..sz[0] {
             let (x, y) = (mx as i32 + o[0], my as i32 + o[1]);
             let g = m[my * sz[0] + mx];
-            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 {
+            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 && p.visible_at(x as usize, y as usize) {
                 let f = &mut p.flat[y as usize * WI + x as usize];
                 let sh = shade_paint(*f, glaze.0, glaze.1, glaze.2);
                 for k in 0..3 {
@@ -2155,7 +2332,9 @@ fn paint_glaze(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], k: f32, id: u3
     }
     let z = zoom();
     let thick = thickness(pts);
-    let Some((mut m, o, sz)) = blurred_cover(pts, (thick * 0.08).min(8.0 * z) + 1.5 * z) else { return };
+    let Some((mut m, o, sz)) = blurred_cover(pts, (thick * 0.08).min(8.0 * z) + 1.5 * z) else {
+        return;
+    };
     for v in &mut m {
         *v = smooth(0.3, 0.6, *v);
     }
@@ -2169,7 +2348,7 @@ fn paint_glaze(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], k: f32, id: u3
         for mx in 0..sz[0] {
             let (x, y) = (mx as i32 + o[0], my as i32 + o[1]);
             let g = m[my * sz[0] + mx];
-            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 {
+            if g > 0.0 && x >= 0 && y >= 0 && x < WI as i32 && y < HI as i32 && p.visible_at(x as usize, y as usize) {
                 let f = &mut p.flat[y as usize * WI + x as usize];
                 for c in 0..3 {
                     f[c] *= 1.0 - g * (1.0 - tint[c]);
@@ -2457,7 +2636,34 @@ pub async fn paint_frame_async(film: &Film, t: f64, seed: u32) -> Result<Vec<u8>
 
 /// Plan and paint a frame's strokes; with `record`, the strokes are written down for the GPU instead of laid
 /// (`finish` lays them).
+/// An editor can preserve per-pixel surface ownership around each semantic item.
+/// The ordinary painter is unchanged when no observer is supplied.
+pub trait PaintObserver {
+    fn begin(&mut self, _p: &mut Painting) {}
+    fn prepare(&mut self, p: &mut Painting, item: &Item) {
+        self.before(p, item);
+    }
+    fn before(&mut self, p: &Painting, item: &Item);
+    fn after(&mut self, p: &mut Painting, item: &Item);
+}
+pub fn paint_frame_observed(film: &Film, t: f64, seed: u32, observer: &mut dyn PaintObserver) -> Vec<u8> {
+    plan_frame_observed(film, t, seed, false, Some(observer)).lit()
+}
+/// The observed oil pass with batched GPU strokes. Observers must attach visibility
+/// to recorded commands instead of restoring pixels. Unsupported media return an error.
+#[cfg(feature = "gpu")]
+pub async fn paint_frame_observed_gpu(film: &Film, t: f64, seed: u32, observer: &mut dyn PaintObserver) -> Result<Vec<u8>, String> {
+    let mut p = plan_frame_observed(film, t, seed, true, Some(observer));
+    let r = p.rec.take().ok_or("This paint style cannot be recorded for the GPU")?;
+    let (col, thick) = gpu::render_async(&r).await?;
+    p.col = col;
+    p.thick = thick;
+    Ok(p.lit())
+}
 fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
+    plan_frame_observed(film, t, seed, record, None)
+}
+fn plan_frame_observed(film: &Film, t: f64, seed: u32, record: bool, mut observer: Option<&mut dyn PaintObserver>) -> Painting {
     DEPTH.store(std::env::var("OIL_DEPTH").is_ok(), Ordering::Relaxed);
     let rec = film.record(film.shot_at(t), t);
     // test hook: OIL_ZOOM multiplies the camera's zoom (to check that brushwork scales with it and is not re-planned)
@@ -2534,7 +2740,18 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
     let progress = PROGRESS.with(|p| p.get());
     let n_items = rec.items.len().max(1) as f32;
     let frame_items: &[Item] = &rec.items;
+    if let Some(o) = observer.as_deref_mut() {
+        o.begin(&mut p);
+    }
+    let mut previous: Option<&Item> = None;
     for (i, it) in rec.items.iter().enumerate() {
+        if let Some(o) = observer.as_deref_mut() {
+            if let Some(item) = previous {
+                o.after(&mut p, item);
+            }
+            o.prepare(&mut p, it);
+        }
+        previous = Some(it);
         if let Some(f) = progress {
             f(i as f32 / n_items);
         }
@@ -2570,7 +2787,9 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
             while let Some(h) = rec.items.get(holes_end).filter(|h| h.id.contains("hole")) {
                 holes_end += 1;
                 let (hp, hz) = screen(h, cam);
-                let Some((m, o, sz)) = shape_mask(&hp, 1.0) else { continue };
+                let Some((m, o, sz)) = shape_mask(&hp, 1.0) else {
+                    continue;
+                };
                 if sz[0].max(sz[1]) < (9.0 * hz) as usize + 6 {
                     continue;
                 }
@@ -3001,6 +3220,9 @@ fn plan_frame(film: &Film, t: f64, seed: u32, record: bool) -> Painting {
             }
         }
     }
+    if let (Some(o), Some(item)) = (observer, previous) {
+        o.after(&mut p, item);
+    }
     if std::env::var("OIL_DBG").is_ok() {
         eprintln!("t {t:.3} zoom {:.3} strokes {}", cam.map_or(1.0, |c| c.zoom), p.strokes);
     }
@@ -3146,14 +3368,32 @@ impl PhotoOptions {
 pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String> {
     let (input, out) = (args.first().ok_or("oilphoto <in> <out.png>")?, args.get(1).ok_or("oilphoto <in> <out.png>")?);
     let img = image::open(input).map_err(|e| e.to_string())?.to_rgb8();
+    let arg = |i: usize, d: f32| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+    paint_photo_image(img, opts, [arg(2, 0.5), arg(3, 0.4), arg(4, 0.34)], Dynamics::default(), 0, &mut |_, _, _| {})?.save(out).map_err(|e| e.to_string())
+}
+/// The complete photo painter without temporary image files. With attention off
+/// the input geometry is preserved; editors can restore their own alpha/depth.
+pub fn paint_photo_image(
+    img: image::RgbImage,
+    opts: &PhotoOptions,
+    focus_input: [f32; 3],
+    dynamics: Dynamics,
+    seed: u32,
+    progress: &mut dyn FnMut(&str, usize, usize),
+) -> Result<image::RgbImage, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Err("Empty photo".into());
+    }
+    progress("Preparing photo", 0, 0);
     // the canvas is landscape: a portrait picture is painted on its side and turned back afterwards
     let turned = img.height() > img.width();
     let img = if turned { image::imageops::rotate270(&img) } else { img };
     let scale = (HI as f32 / img.height() as f32).min(WI as f32 / img.width() as f32);
-    let (rw, rh) = ((img.width() as f32 * scale) as usize, (img.height() as f32 * scale) as usize);
+    let (rw, rh) = (((img.width() as f32 * scale) as usize).max(1), ((img.height() as f32 * scale) as usize).max(1));
     let small = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::Triangle);
     let (ox, oy) = ((WI - rw) / 2, (HI - rh) / 2);
     let mut p = Painting::new();
+    p.dynamics = dynamics;
     let mut subject = p.col.clone();
     for y in 0..rh {
         for x in 0..rw {
@@ -3176,8 +3416,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     // ---- see it as a person does, not as a lens does. A camera gives every part of the scene the same attention
     // through a wide lens. A person looks AT something: that thing is large and clear, and the rest of the room is
     // a few quiet planes. `focus` is where the painter looks (x, y and reach, as fractions of the upright picture).
-    let arg = |i: usize, d: f32| args.get(i).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
-    let (fu, fv, fr) = (arg(2, 0.5), arg(3, 0.4), arg(4, 0.34));
+    let [fu, fv, fr] = focus_input;
     let focus =
         if turned { [ox as f32 + fv * rw as f32, oy as f32 + (1.0 - fu) * rh as f32] } else { [ox as f32 + fu * rw as f32, oy as f32 + fv * rh as f32] };
     let reach_px = fr * rw.max(rh) as f32;
@@ -3185,7 +3424,9 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     // magnification around the focus, no quieting away from it, small brushes allowed everywhere. For a subject
     // that must keep its exact drawn shape (a game sprite painted on its own).
     let attend = opts.attention;
-    let attention = |q: [f32; 2]| if attend { (-(((q[0] - focus[0]).hypot(q[1] - focus[1])) / (1.2 * reach_px)).powi(2)).exp() } else { 1.0 };
+    let attention = |q: [f32; 2]| {
+        if attend { (-(((q[0] - focus[0]).hypot(q[1] - focus[1])) / (1.2 * reach_px)).powi(2)).exp() } else { 1.0 }
+    };
     // DEEP-SEA TEST (crabscape): `OIL_KEY` is the value the unattended room relaxes towards (default 0.56, a daylight
     // middle grey). A nocturne's middle value is near black: there the quiet parts must sink, not lift to grey.
     let key = opts.key;
@@ -3223,6 +3464,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     let lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
     let inside = |q: [f32; 2]| q[0] >= ox as f32 && q[1] >= oy as f32 && q[0] < (ox + rw) as f32 && q[1] < (oy + rh) as f32;
     let px = |q: [f32; 2]| (q[1].clamp(0.0, HI as f32 - 1.0) as usize) * WI + q[0].clamp(0.0, WI as f32 - 1.0) as usize;
+    #[cfg(not(target_arch = "wasm32"))]
     let t0 = std::time::Instant::now();
     // DEEP-SEA TEST (crabscape): `OIL_GROUND=subject` tones the ground with a broad wash of the subject's own colours
     // (an imprimatura laid in to suit the picture) instead of the default warm mid ochre, so a dark picture's
@@ -3240,7 +3482,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         let mut spots: Vec<([f32; 2], u32)> = vec![];
         for gy in 0..(rh as f32 / (w * 0.5)) as u32 + 1 {
             for gx in 0..(rw as f32 / (w * 0.5)) as u32 + 1 {
-                let id = 0x7700_0000 | gy << 12 | gx;
+                let id = (0x7700_0000 | gy << 12 | gx) ^ seed;
                 let q = [ox as f32 + (gx as f32 + hf(id, 1)) * w * 0.5, oy as f32 + (gy as f32 + hf(id, 2)) * w * 0.5];
                 if inside(q) {
                     spots.push((q, id));
@@ -3248,7 +3490,9 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
             }
         }
         spots.sort_by_key(|(_, id)| h32(*id));
-        for (q, id) in spots {
+        let total = spots.len();
+        for (index, (q, id)) in spots.into_iter().enumerate() {
+            progress("Photo block-in", index, total);
             let a = -0.6 + (noise(q[0] / 420.0, q[1] / 420.0, 5) - 0.5) * 0.7;
             let d = [a.cos(), a.sin()];
             let path: Vec<[f32; 2]> = (0..7).map(|i| [q[0] + d[0] * w * 0.45 * (i as f32 - 3.0), q[1] + d[1] * w * 0.45 * (i as f32 - 3.0)]).collect();
@@ -3271,7 +3515,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     let mut seed_col: Vec<[f32; 3]> = vec![[0.0; 3]];
     for gy in 0..(rh / 12) as u32 + 1 {
         for gx in 0..(rw / 12) as u32 + 1 {
-            let q = [ox as f32 + (gx as f32 + hf(gx, gy * 7 + 1)) * 12.0, oy as f32 + (gy as f32 + hf(gx, gy * 7 + 2)) * 12.0];
+            let q = [ox as f32 + (gx as f32 + hf(gx ^ seed, gy * 7 + 1)) * 12.0, oy as f32 + (gy as f32 + hf(gx ^ seed, gy * 7 + 2)) * 12.0];
             if !inside(q) {
                 continue;
             }
@@ -3285,53 +3529,75 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         }
     }
     {
+        #[cfg(not(target_arch = "wasm32"))]
         use rayon::prelude::*;
+        // Evaluate a sparse frontier against an immutable generation, then
+        // apply all changes together. This is the same synchronous automaton;
+        // settled pixels require neither a scan nor a full-canvas copy.
+        let mut active: Vec<usize> = Vec::new();
+        let mut queued = vec![false; WI * HI];
         for round in 0..2 {
+            active.clear();
+            active.extend((oy..oy + rh).flat_map(|y| (ox..ox + rw).map(move |x| y * WI + x)));
             let reach = if round == 0 { 0.30 } else { 3.0 };
-            for _ in 0..400 {
-                let (lab0, str0) = (label.clone(), strength.clone());
-                let changed: usize = label
-                    .par_chunks_mut(WI)
-                    .zip(strength.par_chunks_mut(WI))
-                    .enumerate()
-                    .map(|(y, (lrow, srow))| {
-                        let mut n = 0;
-                        if y < oy || y >= oy + rh {
-                            return 0;
-                        }
-                        for x in ox..ox + rw {
-                            let me = calm[y * WI + x];
-                            let (mut best, mut who) = (srow[x], lrow[x]);
-                            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
-                                let (xx, yy) = (x as i32 + dx, y as i32 + dy);
-                                if xx < ox as i32 || yy < oy as i32 || xx >= (ox + rw) as i32 || yy >= (oy + rh) as i32 {
-                                    continue;
-                                }
-                                let j = yy as usize * WI + xx as usize;
-                                let l = lab0[j];
-                                if l == 0 || l == who {
-                                    continue;
-                                }
-                                let suits = (1.0 - dist(me, seed_col[l as usize]) / reach).max(0.0);
-                                let force = str0[j] * suits * if dx != 0 && dy != 0 { 0.978 } else { 0.985 };
-                                if force > best + 1e-4 {
-                                    (best, who) = (force, l);
-                                }
+            for iteration in 0..400 {
+                progress("Photo structure", round * 400 + iteration, 800);
+                #[cfg(not(target_arch = "wasm32"))]
+                let candidates = active.par_iter();
+                #[cfg(target_arch = "wasm32")]
+                let candidates = active.iter();
+                let changes: Vec<_> = candidates
+                    .filter_map(|&i| {
+                        let (x, y) = (i % WI, i / WI);
+                        let me = calm[i];
+                        let (mut best, mut who) = (strength[i], label[i]);
+                        for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                            let (xx, yy) = (x as i32 + dx, y as i32 + dy);
+                            if xx < ox as i32 || yy < oy as i32 || xx >= (ox + rw) as i32 || yy >= (oy + rh) as i32 {
+                                continue;
                             }
-                            if who != lrow[x] {
-                                (lrow[x], srow[x]) = (who, best);
-                                n += 1;
+                            let j = yy as usize * WI + xx as usize;
+                            let l = label[j];
+                            if l == 0 || l == who {
+                                continue;
+                            }
+                            let suits = (1.0 - dist(me, seed_col[l as usize]) / reach).max(0.0);
+                            let force = strength[j] * suits * if dx != 0 && dy != 0 { 0.978 } else { 0.985 };
+                            if force > best + 1e-4 {
+                                (best, who) = (force, l);
                             }
                         }
-                        n
+                        (who != label[i]).then_some((i, who, best))
                     })
-                    .sum();
-                if changed == 0 {
+                    .collect();
+                if changes.is_empty() {
                     break;
                 }
+                for &i in &active {
+                    queued[i] = false;
+                }
+                active.clear();
+                for (i, who, best) in changes {
+                    label[i] = who;
+                    strength[i] = best;
+                    let (x, y) = (i % WI, i / WI);
+                    for yy in y.saturating_sub(1).max(oy)..=(y + 1).min(oy + rh - 1) {
+                        for xx in x.saturating_sub(1).max(ox)..=(x + 1).min(ox + rw - 1) {
+                            let j = yy * WI + xx;
+                            if !queued[j] {
+                                queued[j] = true;
+                                active.push(j);
+                            }
+                        }
+                    }
+                }
+            }
+            for &i in &active {
+                queued[i] = false;
             }
         }
     }
+
     // join neighbours that are alike (more readily where the picture is calm): big quiet planes become one shape
     let nl = seed_col.len();
     let (mut sum, mut cnt, mut ent) = (vec![[0.0f64; 3]; nl], vec![0.0f64; nl], vec![0.0f64; nl]);
@@ -3370,7 +3636,9 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         [(sum[l][0] / cnt[l].max(1.0)) as f32, (sum[l][1] / cnt[l].max(1.0)) as f32, (sum[l][2] / cnt[l].max(1.0)) as f32]
     };
     let mut order: Vec<(f32, u32, u32)> = pairs.iter().map(|&(a, b)| (dist(mean_of(&sum, &cnt, a as usize), mean_of(&sum, &cnt, b as usize)), a, b)).collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // HashSet traversal is randomized. Equal color distances need stable ties
+    // or identical photos can merge regions in a different order on each run.
+    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     for (_, a, b) in order {
         let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
         if ra == rb {
@@ -3398,6 +3666,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     let mut shapes: Vec<PhotoShape> = vec![];
     let mut stack: Vec<usize> = vec![];
     for y0 in oy..oy + rh {
+        progress("Tracing photo shapes", y0 - oy, rh);
         for x0 in ox..ox + rw {
             if comp[y0 * WI + x0] != 0 {
                 continue;
@@ -3477,10 +3746,12 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
             shapes.push((area, [(col[0] / a) as f32, (col[1] / a) as f32, (col[2] / a) as f32], (en / a) as f32, poly));
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     eprintln!("structure: {} regions from {} seeds, {:.1} s", shapes.len(), nl - 1, t0.elapsed().as_secs_f64());
     // ---- paint the shapes as the film's shapes are painted: biggest first, each with the tool for its job
     shapes.sort_by_key(|s| std::cmp::Reverse(s.0));
     for (k, (area, c, en, poly)) in shapes.iter().enumerate() {
+        progress("Painting photo shapes", k, shapes.len());
         if poly.len() < 3 {
             continue;
         }
@@ -3495,9 +3766,13 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         let alt = shifted(*c, 1.1, 0.5);
         paint_body(&mut p, poly, *c, alt, 0.97, 0x5000 + k as u32, 1.7 - 0.95 * a, 0.5 + 0.65 * a, if quiet { Tool::Flat } else { Tool::Filbert });
     }
+    #[cfg(not(target_arch = "wasm32"))]
     eprintln!("shapes painted: {} strokes, {:.1} s", p.strokes, t0.elapsed().as_secs_f64());
     // ---- then look again, and touch in with the small brushes only where it is still wrong
     for (layer, (w, tool, wrong, load)) in [(13.0f32, Tool::Filbert, 0.11f32, 0.9f32), (SMALLEST, Tool::Round, 0.10, 1.0)].into_iter().enumerate() {
+        // Photo's finishing passes must obey the same stroke-size control as
+        // its shape pass. Previously these stayed coarse at every setting.
+        let w = w * dynamics.stroke_scale.clamp(0.25, 2.0);
         let layer = layer + 2;
         // squint: see the subject no more finely than this brush can paint it
         let seen = box_blur(&subject, (w * 0.38) as usize);
@@ -3509,7 +3784,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
         let mut spots: Vec<([f32; 2], u32)> = vec![];
         for gy in 0..(rh as f32 / step) as u32 + 1 {
             for gx in 0..(rw as f32 / step) as u32 + 1 {
-                let id = (layer as u32) << 24 | gy << 12 | gx;
+                let id = ((layer as u32) << 24 | gy << 12 | gx) ^ seed;
                 let q = [ox as f32 + (gx as f32 + hf(id, 1)) * step, oy as f32 + (gy as f32 + hf(id, 2)) * step];
                 if !inside(q) {
                     continue;
@@ -3526,7 +3801,9 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
             }
         }
         spots.sort_by_key(|(_, id)| h32(*id));
-        for (q, id) in spots {
+        let total = spots.len();
+        for (index, (q, id)) in spots.into_iter().enumerate() {
+            progress("Photo finishing strokes", index, total);
             let c = seen[px(q)];
             // along the edge, not across it; where there is no edge, the painter's own diagonal
             let mut dir = {
@@ -3570,6 +3847,7 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
             let width = w * (0.8 + 0.35 * hf(id, 4));
             sweep(&mut p, tool, &path, width, c, shifted(c, 1.1, 0.5), 0.96, 0.12 + 0.14 * hf(id, 5), load, id, &|_, _, _| 1.0);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         eprintln!("brush {w:>4.0}: {} strokes so far, {:.1} s", p.strokes, t0.elapsed().as_secs_f64());
     }
     // DEEP-SEA TEST (crabscape): the nocturne's values transposed down (see `OIL_NOCTURNE` above)
@@ -3587,7 +3865,8 @@ pub fn run_photo_with(args: &[String], opts: &PhotoOptions) -> Result<(), String
     }
     let done = image::RgbImage::from_raw(rw as u32, rh as u32, crop).ok_or("image")?;
     let done = if turned { image::imageops::rotate90(&done) } else { done };
-    done.save(out).map_err(|e| e.to_string())
+    progress("Photo complete", 1, 1);
+    Ok(done)
 }
 
 /// `oilmix <out.png>`: the same wet-into-wet strokes painted twice. Top: picked-up paint averaged as RGB. Bottom:
@@ -4087,7 +4366,9 @@ pub fn brush_fill(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f3
             hi[k] = hi[k].max(q[k] + reach);
         }
     }
-    let Some(mut mask) = Mask::new(lo, hi) else { return };
+    let Some(mut mask) = Mask::new(lo, hi) else {
+        return;
+    };
     let texture = tex * 3.0;
     let layer_alpha = 2.0 * opacity * (1.0 + tex / 2.0) / 100.0;
     let cap = (2024.0 * (2.0 * bleed).max(0.2)) as usize;
@@ -4141,7 +4422,9 @@ pub fn brush_wash(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f3
             hi[k] = hi[k].max(q[k] + 2.0);
         }
     }
-    let Some(mut mask) = Mask::new(lo, hi) else { return };
+    let Some(mut mask) = Mask::new(lo, hi) else {
+        return;
+    };
     mask.fill(pts, opacity.clamp(0.0, 1.0));
     mask.composite(p, col);
 }
@@ -4163,7 +4446,9 @@ pub fn brush_stroke(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32;
             hi[k] = hi[k].max(q[k] + reach);
         }
     }
-    let Some(mut mask) = Mask::new(lo, hi) else { return };
+    let Some(mut mask) = Mask::new(lo, hi) else {
+        return;
+    };
     let mut r = Roll::new(seed);
     let segs = if closed { n } else { n - 1 };
     let total: f32 = (0..segs).map(|i| (pts[(i + 1) % n][0] - pts[i][0]).hypot(pts[(i + 1) % n][1] - pts[i][1])).sum();
@@ -4246,6 +4531,25 @@ mod tests {
         r.boil("owl");
         r.paint("owl", &ell_pts(760.0, 520.0, 120.0, 150.0, 28, 0.0), wash(rgb(0xB5652F)));
         r.paint("owl", &ell_pts(760.0, 560.0, 72.0, 100.0, 24, 0.0), wash(rgb(0xE8D2A8)).no_ink());
+    }
+
+    #[test]
+    fn a_noop_observer_preserves_the_whole_painting() {
+        struct Noop {
+            count: usize,
+        }
+        impl PaintObserver for Noop {
+            fn before(&mut self, _p: &Painting, _item: &Item) {
+                self.count += 1;
+            }
+            fn after(&mut self, _p: &mut Painting, _item: &Item) {}
+        }
+        let _style = styled(Style { cast: &["owl"], ..Style::DEFAULT });
+        let film = Film::new("dusk", 1.0, vec![Shot::new(0.0, "dusk", dusk)], "/nonexistent/dusk/film");
+        let expected = plan_frame(&film, 0.0, 1, false).lit();
+        let mut observer = Noop { count: 0 };
+        assert_eq!(paint_frame_observed(&film, 0.0, 1, &mut observer), expected);
+        assert!(observer.count >= 5);
     }
 
     #[test]
