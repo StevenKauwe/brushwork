@@ -2,6 +2,38 @@
 
 Versions before 0.6.0 are described in their `brushwork 0.X.Y:` commits.
 
+## Known, for 0.7
+
+Kept for a breaking release, or until something needs them:
+
+- `Stroke::part`'s lands and lifts flags are read by nothing (neither `Painting::stroke` nor the GPU): where a stroke
+  lands and lifts comes from its `span`. Removing them changes `Stroke`, so it waits for 0.7.
+- Watercolour's paper grain (the `water` look) is the canvas's own, not the larger canvas's a window shows
+  (`with_origin`): a window onto a watercolour lights its grain differently from the whole. Only oil paint has been
+  painted in windows so far.
+
+## 0.6.2
+
+The light's varnish and canvas weave are a painting's own, a canvas of any size no longer keeps the plain picture its
+strokes never use, and two fixes to the tests and docs. **No pixel changes:** unless they are set, every stroke,
+light, layer and frame is byte for byte what 0.6.1 painted (`a_new_canvas_paints_as_it_always_has` holds; the example
+frame and the photo painters' outputs hash the same before and after).
+
+- `Painting::varnish` (1.2 unless set): how much richer paint looks lit than its own colour, as varnished paint does.
+  Its chroma is multiplied by this when it is lit; 1 lights it in its own colour. `lit`, `layer_rgba` and the photo
+  painters' light all use it.
+- `Painting::weave` (0.02 unless set): how much the canvas weave shows in the light, the height of its threads as
+  paint thickness; 0 lights no weave at all.
+- `Painting::with_size` makes only the paint (16 bytes a pixel, down from 44): the plain picture the scene painters
+  keep beside it (`flat`, `wet`, and what is behind each shape) is made the first time one of them (`paint_body`,
+  `brush_fill`, `brush_wash`, `brush_stroke`) paints on the canvas, as it was. Strokes alone read it as the ground,
+  as they did. Until then `flat` and `wet` are empty on such a canvas.
+- `Stroke::along` is where the piece's middle is along its whole stroke (as `sweep_path` and the painters set it, and
+  as `stroke` reads it); its doc said where the piece starts.
+- Tests: each test starts on the CPU backend (a test that switched to the GPU left it on for the tests after it, so
+  `OIL_TEST_BACKEND=gpu` runs failed `a_new_canvas_paints_as_it_always_has`, whose frame is the CPU's). A full GPU run
+  is green.
+
 ## 0.6.1
 
 One sweep along a path as a public API, and a long strip painted and lifted only where it shows. **No pixel changes:** every

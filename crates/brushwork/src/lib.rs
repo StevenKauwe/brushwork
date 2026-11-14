@@ -160,6 +160,10 @@ fn softness(family: &str) -> f32 {
     }
 }
 
+/// How much richer paint looks lit than its own colour, unless a painting says otherwise (`Painting::varnish`).
+const VARNISH: f32 = 1.2;
+/// How much the canvas weave shows, unless a painting says otherwise (`Painting::weave`).
+const WEAVE: f32 = 0.02;
 /// The film's canvas: `Painting::new` and every frame are 1920 x 1080 (`Painting::with_size` makes others).
 pub const WI: usize = 1920;
 pub const HI: usize = 1080;
@@ -234,12 +238,14 @@ pub struct Painting {
     pub col: Vec<[f32; 3]>,
     /// The picture in plain colour, shape by shape, with no brushwork. STEADINESS: a brush picks up "what is
     /// under it" from here, not from the painted canvas, whose exact state depends on every stroke before and
-    /// would make one stroke's small change spread through all the strokes over it.
+    /// would make one stroke's small change spread through all the strokes over it. (Empty on a canvas from
+    /// `with_size` until a scene painter paints on it: strokes alone read it as the ground.)
     pub flat: Vec<[f32; 3]>,
     /// Paint thickness.
     pub thick: Vec<f32>,
     /// How much of the plain picture is paint rather than the bare toned ground (0 to 1): a brush can only work
-    /// wet paint into its own, never the canvas's ground.
+    /// wet paint into its own, never the canvas's ground. (Empty on a canvas from `with_size` until a scene painter
+    /// paints on it, as `flat` is.)
     pub wet: Vec<f32>,
     /// The plain picture as it was before the last shape painted over each point: what lies behind it (what an
     /// opening cut in that shape shows).
@@ -251,6 +257,15 @@ pub struct Painting {
     planning_clip: Option<PlanningClip>,
     /// The camera's zoom on the picture as a whole (the paint's relief is lit as if seen from that close).
     pub view: f32,
+    /// How much richer paint looks lit than its own colour, as varnished paint does: its chroma (its distance from
+    /// its own grey) is multiplied by this when it is lit. 1 leaves the colour as it is; 1.2 unless set.
+    pub varnish: f32,
+    /// How much the canvas weave shows in the light: the height of its threads, as paint thickness (it shows where
+    /// the paint is thin, and not at all at 0). 0.02 unless set.
+    pub weave: f32,
+    /// A canvas from `with_size` whose plain picture (`flat`, `behind`, `wet`) is not made yet: its ground. Strokes
+    /// alone never need it; a scene painter makes it (`plain`) before it paints.
+    lean: Option<[f32; 3]>,
     /// How much of each pixel the strokes cover, when kept (`keep_coverage`).
     coverage: Option<Box<Coverage>>,
     /// Where the canvas sits on a larger one it is a window onto (`with_origin`): its weave is that one's.
@@ -284,7 +299,8 @@ pub struct Stroke {
     pub tool: Tool,
     /// What the brush picked up where the whole stroke landed (pieces of one sweep share it).
     pub picked: Option<[f32; 3]>,
-    /// How far along its whole stroke this piece starts, in pixels (so the bristles' marks carry on).
+    /// How far along its whole stroke this piece's middle is, in pixels (so the bristles' marks carry on: the piece
+    /// measures its own pixels along it from its middle).
     pub along: f32,
     pub c: [f32; 2],
     pub angle: f32,
@@ -389,6 +405,9 @@ impl Painting {
             rec: None,
             planning_clip: None,
             view: 1.0,
+            varnish: VARNISH,
+            weave: WEAVE,
+            lean: None,
             coverage: None,
             origin: [0, 0],
         }
@@ -397,25 +416,29 @@ impl Painting {
     /// A blank canvas of any size, all one `ground` colour (0 to 1, as `col`): a strip, a tile, a sprite, laid
     /// with strokes directly. `stroke`, `lit`, `keep_coverage` and `layer_rgba` work at any size; the scene
     /// painters (`paint_frame`, `paint_body`, `brush_fill` and the rest, the photo painters) frame their shapes on
-    /// the film's 1920 x 1080 and want `new()`. Its memory is about 44 bytes a pixel, so a canvas the size of what
-    /// is painted is much quicker to make and light than the film's (2 million pixels, about 90 MB).
+    /// the film's 1920 x 1080 and want `new()`. Its memory is 16 bytes a pixel (the paint's colour and thickness),
+    /// so a canvas the size of what is painted is much quicker to make and light than the film's (2 million pixels,
+    /// about 90 MB): the plain picture the scene painters keep beside the paint (`flat`, `wet`, 28 bytes a pixel
+    /// more) is made only if one paints on it, and strokes alone read it as the ground.
     pub fn with_size(width: usize, height: usize, ground: [f32; 3]) -> Painting {
         assert!(width > 0 && height > 0, "a canvas needs at least one pixel");
-        let col = vec![ground; width * height];
         Painting {
             canvas: [width, height],
             fast_photo: false,
             mix_cache: None,
             dynamics: Dynamics::default(),
-            flat: col.clone(),
-            behind: col.clone(),
-            col,
+            flat: vec![],
+            behind: vec![],
+            col: vec![ground; width * height],
             thick: vec![0.0; width * height],
-            wet: vec![0.0; width * height],
+            wet: vec![],
             strokes: 0,
             rec: None,
             planning_clip: None,
             view: 1.0,
+            varnish: VARNISH,
+            weave: WEAVE,
+            lean: Some(ground),
             coverage: None,
             origin: [0, 0],
         }
@@ -424,6 +447,24 @@ impl Painting {
     /// The canvas's size in pixels, [width, height].
     pub fn size(&self) -> [usize; 2] {
         self.canvas
+    }
+
+    /// Make the plain picture of a canvas from `with_size` (all its ground, none of it wet paint), as it was before
+    /// it was made only when needed: the scene painters call this before they paint.
+    fn plain(&mut self) {
+        if let Some(g) = self.lean.take() {
+            let n = self.canvas[0] * self.canvas[1];
+            (self.flat, self.behind, self.wet) = (vec![g; n], vec![g; n], vec![0.0; n]);
+        }
+    }
+
+    /// What the plain picture is at pixel `i` (the ground everywhere, on a canvas from `with_size` that has only had
+    /// strokes laid on it).
+    fn flat_at(&self) -> impl Fn(usize) -> [f32; 3] + '_ {
+        move |i| match self.lean {
+            Some(g) => g,
+            None => self.flat[i],
+        }
     }
 
     /// This canvas as a window onto a larger one, its top left at `origin` there: the canvas weave the light shows is
@@ -476,6 +517,9 @@ impl Painting {
             rec: None,
             planning_clip: None,
             view: 1.0,
+            varnish: VARNISH,
+            weave: WEAVE,
+            lean: None,
             coverage: None,
             origin: [0, 0],
         }
@@ -515,7 +559,7 @@ impl Painting {
         // the paint already there, where the brush lands
         let start = [s.c[0] - cs * s.len * 0.4, s.c[1] - sn * s.len * 0.4];
         // a stroke that lands off the canvas has nothing to pick up (not whatever happens to be at the canvas edge)
-        let under = s.picked.unwrap_or_else(|| flat_under_sized(&self.flat, start[0], start[1], s.width * 0.3, self.canvas));
+        let under = s.picked.unwrap_or_else(|| flat_under_sized(self.flat_at(), start[0], start[1], s.width * 0.3, self.canvas));
         let premix = if self.fast_photo { 1. } else { PREMIX.with(|p| p.get()) };
         let fade = if self.fast_photo { 1. } else { FADE.with(|f| f.get()) };
         if fade <= 0.0 {
@@ -1028,7 +1072,7 @@ impl Painting {
         }
         let hgt = |x: usize, y: usize| -> f32 {
             let (xf, yf) = ((x + self.origin[0]) as f32, (y + self.origin[1]) as f32);
-            let weave = 0.02 * ((xf * 1.55).sin() * (yf * 1.55).sin());
+            let weave = self.weave * ((xf * 1.55).sin() * (yf * 1.55).sin());
             let (x, y) = (x.min(wi - 1), y.min(hi - 1));
             let t = soft[(y - sy0) * sw + x - sx0];
             t + weave * (1.0 - t).clamp(0.15, 1.0) * under(y * wi + x)
@@ -1048,7 +1092,7 @@ impl Painting {
                 // a little richer, as varnished paint is
                 let grey = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
                 for k in 0..3 {
-                    let v = (grey + (c[k] - grey) * 1.2) * shade + spec.max(0.0) * 0.30 * BODY;
+                    let v = (grey + (c[k] - grey) * self.varnish) * shade + spec.max(0.0) * 0.30 * BODY;
                     out[at(x, y) + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
             }
@@ -1628,15 +1672,16 @@ fn signed_depth(pts: &[[f32; 2]], q: [f32; 2], cap: f32) -> f32 {
 /// down with itself, laid at full strength, and a faint band cut by the frame grew a bright white tip, coming and
 /// going as the band moved across the edge.)
 fn flat_under(flat: &[[f32; 3]], x: f32, y: f32, r: f32) -> [f32; 3] {
-    flat_under_sized(flat, x, y, r, [WI, HI])
+    flat_under_sized(|i| flat[i], x, y, r, [WI, HI])
 }
-fn flat_under_sized(flat: &[[f32; 3]], x: f32, y: f32, r: f32, [width, height]: [usize; 2]) -> [f32; 3] {
+/// `flat_under` on a canvas of any size, the plain picture read pixel by pixel.
+fn flat_under_sized(flat: impl Fn(usize) -> [f32; 3], x: f32, y: f32, r: f32, [width, height]: [usize; 2]) -> [f32; 3] {
     let r = r.clamp(1.0, height as f32 * 0.45);
     let bil = |x: f32, y: f32| -> [f32; 3] {
         let (x, y) = (x.clamp(0.0, width as f32 - 1.001), y.clamp(0.0, height as f32 - 1.001));
         let (x0, y0) = (x.floor() as usize, y.floor() as usize);
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-        let (a, b, c, d) = (flat[y0 * width + x0], flat[y0 * width + x0 + 1], flat[(y0 + 1) * width + x0], flat[(y0 + 1) * width + x0 + 1]);
+        let (a, b, c, d) = (flat(y0 * width + x0), flat(y0 * width + x0 + 1), flat((y0 + 1) * width + x0), flat((y0 + 1) * width + x0 + 1));
         std::array::from_fn(|k| (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy)
     };
     // (the patch is moved in onto the canvas as a whole, so it never straddles the edge)
@@ -1797,6 +1842,7 @@ fn glaze(p: &mut Painting, c: [f32; 3], k: f32) {
 }
 
 pub fn paint_body(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], alt: [f32; 3], opacity: f32, seed: u32, detail: f32, body: f32, tool: Tool) {
+    p.plain();
     paint_form(p, pts, col, alt, opacity, seed, detail, body, tool, 0.0)
 }
 
@@ -2475,7 +2521,7 @@ fn sweep(
             path[path.len() - 1][1]
         );
     }
-    let picked = flat_under_sized(&p.flat, path[0][0], path[0][1], width * 0.3, p.canvas);
+    let picked = flat_under_sized(p.flat_at(), path[0][0], path[0][1], width * 0.3, p.canvas);
     for Piece { i, a, b, l, walked } in laid {
         let state = weight(p, [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], [(b[0] - a[0]) / l, (b[1] - a[1]) / l]);
         if state > 0.04 {
@@ -4630,6 +4676,7 @@ impl Mask {
 /// p5.brush's `fill`. `opacity` 0..1; the kit's usual bleed 0.1, texture 0.4, border 0.35.
 #[allow(clippy::too_many_arguments)]
 pub fn brush_fill(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f32, bleed: f32, tex: f32, border: f32, seed: u32) {
+    p.plain();
     let n = pts.len();
     if n < 3 {
         return;
@@ -4732,6 +4779,7 @@ pub fn brush_fill(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f3
 
 /// p5.brush's `wash`: the shape as one flat layer of pigment.
 pub fn brush_wash(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f32) {
+    p.plain();
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
     for q in pts {
         for k in 0..2 {
@@ -4751,6 +4799,7 @@ pub fn brush_wash(p: &mut Painting, pts: &[[f32; 2]], col: [f32; 3], opacity: f3
 /// the square of the pressure, which runs from 1.15 at the start of the stroke to 0.75 at its end. `width` is the
 /// stroke's width at pressure 1.
 pub fn brush_stroke(p: &mut Painting, pts: &[[f32; 2]], closed: bool, col: [f32; 3], width: f32, seed: u32) {
+    p.plain();
     let n = pts.len();
     if n < 2 || width <= 0.0 {
         return;
@@ -4814,11 +4863,15 @@ mod tests {
     /// strokes down and `done` lays them on the GPU before anything is measured.
     /// The film's style is global, and tests run side by side: a test that paints with a style holds it for as long
     /// as it paints (another test switching the cast half way through one test's frames moves the painter's focus
-    /// and recolours the whole picture between two of its frames).
+    /// and recolours the whole picture between two of its frames). The backend is global too, and goes with it: each
+    /// test starts on the CPU and one that paints on the GPU says so after this (a test that switched to the GPU
+    /// used to leave it on for every test after it, so in a full `OIL_TEST_BACKEND=gpu` run a test of the CPU's own
+    /// fingerprints painted its frame on the GPU).
     fn styled(s: Style) -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_style(s);
+        set_backend(Backend::Cpu);
         guard
     }
 
@@ -5764,6 +5817,62 @@ mod tests {
             }
         }
         assert!(lit_px > 5000, "the strokes must have painted something ({lit_px} pixels)");
+    }
+
+    #[test]
+    fn a_canvas_of_any_size_makes_its_plain_picture_only_when_a_scene_painter_needs_it() {
+        // Strokes alone never make the plain picture of a canvas from `with_size` (they read it as the ground); a
+        // scene painter makes it first, so it paints there exactly what it paints on the film's canvas on that
+        // ground.
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let mut lean = Painting::with_size(WI, HI, CREAM);
+        let mut full = Painting::new();
+        for v in [&mut full.col, &mut full.flat, &mut full.behind] {
+            v.fill(CREAM);
+        }
+        for s in &sample_strokes(300.0, 200.0) {
+            lean.stroke(s, None);
+            full.stroke(s, None);
+        }
+        assert!(lean.flat.is_empty() && lean.wet.is_empty() && lean.behind.is_empty(), "strokes alone made the plain picture");
+        assert!(lean.col == full.col && lean.thick == full.thick, "strokes on a lean canvas laid other paint");
+        let disc: Vec<[f32; 2]> = (0..28)
+            .map(|i| {
+                let a = i as f32 / 28.0 * std::f32::consts::TAU;
+                [900.0 + 120.0 * a.cos(), 500.0 + 90.0 * a.sin()]
+            })
+            .collect();
+        for p in [&mut lean, &mut full] {
+            brush_fill(p, &disc, [0.2, 0.4, 0.6], 1.0, 0.0, 1.0, 0.0, 7);
+        }
+        assert_eq!((lean.flat.len(), lean.wet.len(), lean.behind.len()), (WI * HI, WI * HI, WI * HI));
+        assert!(lean.col == full.col && lean.thick == full.thick, "a scene painter painted a lean canvas differently");
+        assert!(lean.flat == full.flat && lean.wet == full.wet && lean.behind == full.behind, "the plain pictures differ");
+    }
+
+    #[test]
+    fn varnish_and_weave_are_the_paintings_own() {
+        // Unless set, a painting is lit with the varnish and weave it always was (`a_new_canvas_paints_as_it_always_has`
+        // holds their fingerprints). Set, they change the light and nothing else: no weave lights bare canvas evenly,
+        // and less varnish lights paint nearer its own colour.
+        let _style = styled(Style::DEFAULT);
+        ZOOM.with(|z| z.set(1.0));
+        let mut p = Painting::with_size(96, 48, [0.8, 0.35, 0.2]);
+        assert_eq!((p.varnish, p.weave), (1.2, 0.02));
+        let chroma = |px: &[u8]| px.chunks(3).map(|c| (*c.iter().max().unwrap() - *c.iter().min().unwrap()) as u32).sum::<u32>();
+        let woven = p.lit();
+        assert!(woven.chunks(3).any(|c| c != &woven[..3]), "the weave does not show");
+        p.weave = 0.0;
+        let even = p.lit();
+        assert!(even.chunks(3).all(|c| c == &even[..3]), "no weave still shows threads");
+        p.varnish = 1.0;
+        let own = p.lit();
+        assert!(chroma(&own) < chroma(&even), "less varnish is not nearer the paint's own colour");
+        p.stroke(&sample_strokes(0.0, 0.0)[0], None);
+        let mut q = Painting::with_size(96, 48, [0.8, 0.35, 0.2]);
+        q.stroke(&sample_strokes(0.0, 0.0)[0], None);
+        assert!(p.col == q.col && p.thick == q.thick, "varnish or weave changed the paint");
     }
 
     #[test]
