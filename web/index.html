@@ -93,12 +93,13 @@
     there, in a colour mixed from it and the light. A glow is a light: luminous paint that lights the sky and the paint round it, and
     the scene's light comes from it. The painting runs on your device, in a Web Worker: on its graphics card where the browser
     offers WebGPU, otherwise on its processor (the label on the canvas says which).
-    <a href="https://github.com/StevenKauwe/brushwork">Source on GitHub</a> (MIT).
+    <a href="photo.html">Fast photo painter</a> · <a href="https://github.com/StevenKauwe/brushwork">Source on GitHub</a> (MIT).
   </footer>
 </main>
 <script type="module">
   import init, { app_start } from "./brushwork_web.js";
-  init().then(() => app_start()).catch((e) => {
+  import { boot } from "./engine-loader.mjs";
+  boot(init, {engine: new URL(location.href).searchParams.get("engine")}).then(engine => { document.body.dataset.wasmEngine = engine; app_start(); }).catch((e) => {
     document.getElementById("status").textContent = "Could not start the painter: " + e;
   });
 </script>

@@ -212,7 +212,7 @@ pub fn app_start() -> Result<(), JsValue> {
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d")?.ok_or("no 2d context")?.dyn_into()?;
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
-    let worker = Worker::new_with_options("./worker.js", &opts)?;
+    let worker = Worker::new_with_options(&format!("./worker.js{}", win.location().search().unwrap_or_default()), &opts)?;
     let force_cpu = win.location().search().unwrap_or_default().contains("backend=cpu");
     let app: Shared = Rc::new(RefCell::new(App {
         doc: doc.clone(),
@@ -247,6 +247,13 @@ pub fn app_start() -> Result<(), JsValue> {
                 return;
             }
             let msg = js_sys::Array::from(&data);
+            if msg.get(0).as_string().as_deref() == Some("error") {
+                a.busy = false;
+                a.status(&msg.get(1).as_string().unwrap_or_else(|| "Painter failed to start".into()), None);
+                a.show();
+                let _ = a.canvas.set_attribute("data-state", "failed");
+                return;
+            }
             // the worker found (or lost) the GPU: ["backend", kind, detail]
             if msg.get(0).as_string().as_deref() == Some("backend") {
                 let kind = msg.get(1).as_string().unwrap_or_default();

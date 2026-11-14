@@ -25,7 +25,7 @@
 /// One planned stroke (or, with `kind == 1`, a full-frame glaze; with `kind == 2`, a glaze over one shape's mask),
 /// as the GPU reads it. All scalars, 4 bytes each.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct Cmd {
     pub cx: f32,
     pub cy: f32,
@@ -77,15 +77,22 @@ pub(crate) struct Cmd {
     /// with tool = 1, light falling on it (col near the light, alt at its reach, opacity at most), or with tool = 2 a shadow (col = the shadow
     /// colour, bend = how much of it is worked in, along = the value step)
     pub kind: u32,
-    pub _pad: [u32; 15],
+    /// A resolved visible region, independent of the complete shape used to plan strokes.
+    pub clip_off: u32,
+    pub clip_ox: i32,
+    pub clip_oy: i32,
+    pub clip_w: u32,
+    pub clip_h: u32,
+    pub _pad: [u32; 10],
 }
 // SAFETY: Cmd is repr(C), made only of f32/u32/i32 (and arrays of them), with no padding (64 x 4 bytes).
-unsafe impl bytemuck::Zeroable for Cmd {}
-unsafe impl bytemuck::Pod for Cmd {}
 const _: () = assert!(std::mem::size_of::<Cmd>() == 64 * 4);
 
 /// The strokes of one frame, in the order they were planned, and what they need.
 pub(crate) struct Recorder {
+    pub canvas: [usize; 2],
+    last_worked: Option<([[[f32; 3]; 9]; 2], u32)>,
+    pub initial_thick: Option<Vec<f32>>,
     pub cmds: Vec<Cmd>,
     /// Masks, losslessly in 16 x 16 blocks: per mask a table with one entry per block (0: all 0.0, 1: all 1.0,
     /// n >= 2: the block's 256 values start at index n - 2 of this same buffer, as f32 bits). Big shapes are
@@ -102,10 +109,24 @@ pub(crate) struct Recorder {
 
 impl Recorder {
     pub fn new(ground: Vec<[f32; 3]>) -> Recorder {
-        Recorder { cmds: vec![], masks: vec![], worked: vec![], mask: None, bands: vec![], ground }
+        Recorder {
+            canvas: [super::WI, super::HI],
+            last_worked: None,
+            initial_thick: None,
+            cmds: vec![],
+            masks: vec![],
+            worked: vec![],
+            mask: None,
+            bands: vec![],
+            ground,
+        }
     }
     /// The mask the next strokes are clipped to (a shape's, from `paint_form`).
     pub fn use_mask(&mut self, m: &[f32], o: [i32; 2], sz: [usize; 2]) {
+        self.mask = Some(self.store_mask(m, o, sz));
+    }
+    /// Store a region without replacing the current stroke's shape mask.
+    pub fn store_mask(&mut self, m: &[f32], o: [i32; 2], sz: [usize; 2]) -> (u32, [i32; 2], [usize; 2]) {
         let (bw, bh) = (sz[0].div_ceil(TILE), sz[1].div_ceil(TILE));
         let off = self.masks.len();
         self.masks.resize(off + bw * bh, 0);
@@ -138,15 +159,22 @@ impl Recorder {
                 };
             }
         }
-        self.mask = Some((off as u32, o, sz));
+        (off as u32, o, sz)
     }
     pub fn push(&mut self, mut c: Cmd, worked: Option<&[[[f32; 3]; 9]; 2]>, bands: Vec<(u32, i32, i32)>) {
         if let Some(w) = worked {
-            c.worked = (self.worked.len() / 3) as u32;
-            for side in w {
-                for rgb in side {
-                    self.worked.extend_from_slice(rgb);
+            if let Some((old, offset)) = &self.last_worked
+                && old == w
+            {
+                c.worked = *offset;
+            } else {
+                c.worked = (self.worked.len() / 3) as u32;
+                for side in w {
+                    for rgb in side {
+                        self.worked.extend_from_slice(rgb);
+                    }
                 }
+                self.last_worked = Some((*w, c.worked));
             }
         }
         self.cmds.push(c);
@@ -161,7 +189,7 @@ impl Recorder {
     pub fn glaze_area(&mut self, tint: [f32; 3], anchor: [f32; 2], dir: [f32; 2], z: f32, id: u32, mode: u32, mix: f32, step: f32, alt: [f32; 3], a: f32) {
         let (off, o, sz) = self.mask.expect("a shape's glaze needs its mask handed over first (Recorder::use_mask)");
         let (x0, y0) = (o[0].max(0), o[1].max(0));
-        let (x1, y1) = ((o[0] + sz[0] as i32 - 1).min(super::WI as i32 - 1), (o[1] + sz[1] as i32 - 1).min(super::HI as i32 - 1));
+        let (x1, y1) = ((o[0] + sz[0] as i32 - 1).min(self.canvas[0] as i32 - 1), (o[1] + sz[1] as i32 - 1).min(self.canvas[1] as i32 - 1));
         if x1 < x0 || y1 < y0 {
             return;
         }
@@ -195,8 +223,8 @@ impl Recorder {
         self.bands.push(bands);
     }
     pub fn glaze(&mut self, col: [f32; 3], k: f32) {
-        let c = Cmd { col, opacity: k, kind: 1, x0: 0, x1: super::WI as i32 - 1, y0: 0, y1: super::HI as i32 - 1, ..Default::default() };
-        let bands = (0..super::HI.div_ceil(TILE) as u32).map(|t| (t, 0, super::WI as i32 - 1)).collect();
+        let c = Cmd { col, opacity: k, kind: 1, x0: 0, x1: self.canvas[0] as i32 - 1, y0: 0, y1: self.canvas[1] as i32 - 1, ..Default::default() };
+        let bands = (0..self.canvas[1].div_ceil(TILE) as u32).map(|t| (t, 0, self.canvas[0] as i32 - 1)).collect();
         self.cmds.push(c);
         self.bands.push(bands);
     }
@@ -207,11 +235,11 @@ pub(crate) const TILE: usize = 16;
 /// Bin the strokes into tiles, in order: per tile, the indices of the strokes that can touch it.
 #[cfg(feature = "gpu")]
 pub(crate) fn bin(r: &Recorder) -> (Vec<u32>, Vec<u32>) {
-    let (tw, th) = (super::WI.div_ceil(TILE), super::HI.div_ceil(TILE));
+    let (tw, th) = (r.canvas[0].div_ceil(TILE), r.canvas[1].div_ceil(TILE));
     let mut lists: Vec<Vec<u32>> = vec![vec![]; tw * th];
     for (i, bands) in r.bands.iter().enumerate() {
         for &(ty, lo, hi) in bands {
-            for tx in (lo.max(0) as usize / TILE)..=((hi.max(0) as usize).min(super::WI - 1) / TILE) {
+            for tx in (lo.max(0) as usize / TILE)..=((hi.max(0) as usize).min(r.canvas[0] - 1) / TILE) {
                 lists[ty as usize * tw + tx].push(i as u32);
             }
         }
@@ -248,9 +276,8 @@ mod backend {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline: wgpu::ComputePipeline,
+        fast_pipelines: Vec<([usize; 2], wgpu::ComputePipeline)>,
         layout: wgpu::BindGroupLayout,
-        /// the toned ground, uploaded once (every GPU frame starts from the same one), with a hash to check it
-        ground: Mutex<Option<(u64, Arc<wgpu::Buffer>)>>,
         /// set by wgpu when the device goes away (a driver reset, the browser reclaiming it): the next `open`
         /// makes a new one
         lost: Arc<AtomicBool>,
@@ -309,7 +336,24 @@ mod backend {
                 compilation_options: Default::default(),
                 cache: None,
             });
-            Ok(Gpu { device, queue, pipeline, layout, ground: Mutex::new(None), lost, name: info.name })
+            let fast_pipelines = [[480, 270], [960, 540], [1280, 720]]
+                .into_iter()
+                .map(|canvas| {
+                    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("photo strokes at selected resolution"),
+                        layout: Some(&pl),
+                        module: &module,
+                        entry_point: Some("main"),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[("WI", canvas[0] as f64), ("HI", canvas[1] as f64)],
+                            ..Default::default()
+                        },
+                        cache: None,
+                    });
+                    (canvas, pipeline)
+                })
+                .collect();
+            Ok(Gpu { device, queue, pipeline, fast_pipelines, layout, lost, name: info.name })
         }
     }
 
@@ -379,28 +423,22 @@ mod backend {
         let since = |t: Option<std::time::Instant>| t.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let (offsets, entries) = bin(r);
         let t_bin = since(t0);
-        let n = super::super::WI * super::super::HI;
-        // the ground: the same for every frame, so it lives on the GPU and is copied into each frame's canvas
-        let key = r.ground.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, c| c.iter().fold(h, |h, v| (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3)));
-        let ground = {
-            let mut g0 = g.ground.lock().unwrap_or_else(|e| e.into_inner());
-            match g0.as_ref() {
-                Some((k, b)) if *k == key => b.clone(),
-                _ => {
-                    let col0: Vec<f32> = r.ground.iter().flat_map(|c| c.iter().copied()).collect();
-                    let b = Arc::new(g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("ground"),
-                        contents: bytemuck::cast_slice(&col0),
-                        usage: wgpu::BufferUsages::COPY_SRC,
-                    }));
-                    *g0 = Some((key, b.clone()));
-                    b
-                }
-            }
-        };
+        let [width, height] = r.canvas;
+        if r.canvas != [super::super::WI, super::super::HI] && !g.fast_pipelines.iter().any(|(size, _)| *size == r.canvas) {
+            return Err("Unsupported paint canvas size".into());
+        }
+        let n = width * height;
+        if r.ground.len() != n || r.initial_thick.as_ref().is_some_and(|t| t.len() != n) {
+            return Err("Invalid paint canvas buffers".into());
+        }
+        let ground = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("photo ground"),
+            contents: bytemuck::cast_slice(&r.ground),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
         let scope_mem = g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let scope_valid = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let nonempty = |v: &[f32]| if v.is_empty() { vec![0.0f32] } else { v.to_vec() };
+        let worked: &[f32] = if r.worked.is_empty() { &[0.0] } else { &r.worked };
         let cmds: &[Cmd] = if r.cmds.is_empty() { &[Cmd { kind: 2, ..Default::default() }] } else { &r.cmds };
         let mk = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
             g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage })
@@ -409,13 +447,16 @@ mod backend {
         let b_cmds = mk("cmds", bytemuck::cast_slice(cmds), ro);
         let masks: &[u32] = if r.masks.is_empty() { &[0] } else { &r.masks };
         let b_masks = mk("masks", bytemuck::cast_slice(masks), ro);
-        let b_worked = mk("worked", bytemuck::cast_slice(&nonempty(&r.worked)), ro);
+        let b_worked = mk("worked", bytemuck::cast_slice(worked), ro);
         let b_off = mk("offsets", bytemuck::cast_slice(&offsets), ro);
         let b_ent = mk("entries", bytemuck::cast_slice(&entries), ro);
         let rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         // (wgpu hands out new buffers zeroed: the thickness starts at nothing without an upload)
         let b_col = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("col"), size: (n * 12) as u64, usage: rw, mapped_at_creation: false });
         let b_thick = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("thick"), size: (n * 4) as u64, usage: rw, mapped_at_creation: false });
+        if let Some(thick) = &r.initial_thick {
+            g.queue.write_buffer(&b_thick, 0, bytemuck::cast_slice(thick));
+        }
         let bind = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("oil"),
             layout: &g.layout,
@@ -443,9 +484,9 @@ mod backend {
         enc.copy_buffer_to_buffer(&ground, 0, &b_col, 0, (n * 12) as u64);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("strokes"), timestamp_writes: None });
-            pass.set_pipeline(&g.pipeline);
+            pass.set_pipeline(g.fast_pipelines.iter().find(|(size, _)| *size == r.canvas).map(|(_, pipeline)| pipeline).unwrap_or(&g.pipeline));
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(super::super::WI.div_ceil(TILE) as u32, super::super::HI.div_ceil(TILE) as u32, 1);
+            pass.dispatch_workgroups(width.div_ceil(TILE) as u32, height.div_ceil(TILE) as u32, 1);
         }
         enc.copy_buffer_to_buffer(&b_col, 0, &r_col, 0, (n * 12) as u64);
         enc.copy_buffer_to_buffer(&b_thick, 0, &r_thick, 0, (n * 4) as u64);

@@ -111,6 +111,7 @@ dependencies = [
  "brushwork",
  "brushwork-kit",
  "brushwork-paint",
+ "image",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
