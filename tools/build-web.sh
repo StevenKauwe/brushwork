@@ -14,9 +14,9 @@ cp target/wasm-simd/glue/brushwork_web_bg.wasm dist/brushwork_web_simd.wasm
 OPT="${WASM_OPT:-$(command -v wasm-opt || true)}"
 if [ -n "$OPT" ]; then
   for name in bg simd; do
-    extra=()
-    if [ "$name" = simd ]; then extra+=(--enable-simd); fi
-    "$OPT" -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals "${extra[@]}" -o "dist/brushwork_web_$name.wasm" "dist/brushwork_web_$name.wasm"
+    options=(-O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals)
+    if [ "$name" = simd ]; then options+=(--enable-simd); fi
+    "$OPT" "${options[@]}" -o "dist/brushwork_web_$name.wasm" "dist/brushwork_web_$name.wasm"
   done
 fi
 cp web/index.html web/worker.js web/engine-loader.mjs web/photo.html web/photo-worker.js dist/

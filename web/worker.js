@@ -7,4 +7,4 @@ self.onmessage = (e) => waiting.push(e);
 boot(init, {engine: new URL(import.meta.url).searchParams.get("engine")}).then(() => {
   worker_start();
   for (const e of waiting) self.onmessage(e);
-}).catch(error => self.postMessage(["backend", "cpu", "Painter failed to start: " + error.message]));
+}).catch(error => self.postMessage(["error", "Painter failed to start: " + error.message]));

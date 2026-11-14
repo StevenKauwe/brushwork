@@ -247,6 +247,13 @@ pub fn app_start() -> Result<(), JsValue> {
                 return;
             }
             let msg = js_sys::Array::from(&data);
+            if msg.get(0).as_string().as_deref() == Some("error") {
+                a.busy = false;
+                a.status(&msg.get(1).as_string().unwrap_or_else(|| "Painter failed to start".into()), None);
+                a.show();
+                let _ = a.canvas.set_attribute("data-state", "failed");
+                return;
+            }
             // the worker found (or lost) the GPU: ["backend", kind, detail]
             if msg.get(0).as_string().as_deref() == Some("backend") {
                 let kind = msg.get(1).as_string().unwrap_or_default();
