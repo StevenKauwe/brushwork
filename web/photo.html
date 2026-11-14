@@ -6,7 +6,7 @@
 <input id="file" type="file" accept="image/*" aria-label="Choose a photo">
 <label>Paint resolution <select id="resolution"><option>270</option><option selected>540</option><option>720</option><option>1080</option></select></label>
 <label><input id="steady" type="checkbox">Steady stroke layout</label><label><input id="cpu" type="checkbox">Detailed CPU</label>
-<button id="paint">Paint</button><button id="cancel" disabled>Cancel</button><p id="status" role="status">Choose a photo or paint the sample.</p>
+<button id="paint" disabled>Paint</button><button id="cancel" disabled>Cancel</button><p id="status" role="status">Choose a photo or paint the sample.</p>
 <div class="views"><div>Source<canvas id="source" width="480" height="270"></canvas></div><div>Oil finish<canvas id="result" width="480" height="270"></canvas></div></div>
 <p>Higher resolution keeps finer detail and takes longer. Detailed CPU uses its full internal canvas. <a href="index.html">Shape painter</a> · <a href="https://github.com/StevenKauwe/brushwork">Source</a></p>
 <script type="module">
@@ -18,4 +18,5 @@ function connect(){worker=new Worker('photo-worker.js'+location.search,{type:'mo
 connect();$('cancel').onclick=()=>{serial++;worker.terminate();connect();setBusy(false);$('status').textContent='Cancelled. Source photo retained.'};
 $('file').onchange=async()=>{const file=$('file').files[0];if(!file)return;try{const im=await createImageBitmap(file);const s=Math.min(1,1920/im.width,1080/im.height);source.width=Math.max(1,Math.round(im.width*s));source.height=Math.max(1,Math.round(im.height*s));ctx.drawImage(im,0,0,source.width,source.height);im.close();$('status').textContent='Photo ready.'}catch(e){$('status').textContent='Could not load photo: '+e.message}};
 $('paint').onclick=()=>{setBusy(true);$('status').textContent='Painting in worker…';const image=ctx.getImageData(0,0,source.width,source.height);worker.postMessage({id:++serial,pixels:image.data,width:image.width,height:image.height,resolution:Number($('resolution').value),steady:$('steady').checked,cpu:$('cpu').checked||new URL(location.href).searchParams.get('backend')==='cpu'},[image.data.buffer])};
+setBusy(false);
 </script></html>

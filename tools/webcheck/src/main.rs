@@ -326,10 +326,18 @@ impl Drop for Browser {
 /// Exercise the actual photo worker, including cancelling and restarting it.
 fn check_photo(b: &Browser, url: &str, engine: &str, expected: Option<String>) -> Result<()> {
     b.call("POST", "/url", Some(json!({"url":format!("{}photo.html?engine={engine}", url.trim_end_matches('/').to_string()+"/")})))?;
-    b.js("document.getElementById('paint').click(); document.getElementById('cancel').click(); return true;")?;
-    let cancelled = b.js("return document.getElementById('status').textContent;")?;
+    // WebDriver navigation may return before a module's deferred handlers are installed.
+    let ready = Instant::now();
+    while b.js("return document.body.dataset.state;")?.as_str() != Some("ready") {
+        if ready.elapsed() > Duration::from_secs(30) {
+            return Err(format!("photo UI did not become ready: {}", b.js("return document.getElementById('status').textContent;")?));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let cancelled =
+        b.js("document.getElementById('paint').click(); document.getElementById('cancel').click(); return document.getElementById('status').textContent;")?;
     if !cancelled.as_str().unwrap_or("").contains("Cancelled") {
-        return Err("photo cancellation failed".into());
+        return Err(format!("photo cancellation failed: {cancelled}"));
     }
     b.js("document.getElementById('paint').click(); return true;")?;
     let t = Instant::now();
