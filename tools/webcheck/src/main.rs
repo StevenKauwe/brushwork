@@ -129,7 +129,7 @@ fn serve(dir: PathBuf) -> Result<u16> {
             };
             let mime = match file.extension().and_then(|e| e.to_str()) {
                 Some("html") => "text/html; charset=utf-8",
-                Some("js") => "text/javascript",
+                Some("js" | "mjs") => "text/javascript",
                 Some("wasm") => "application/wasm",
                 Some("png") => "image/png",
                 _ => "application/octet-stream",
@@ -502,5 +502,24 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("webcheck: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn the_server_delivers_the_real_module_loader_as_javascript() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().join("web");
+        let port = serve(root).unwrap();
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.write_all(b"GET /engine-loader.mjs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: text/javascript"));
+        assert!(body.contains("export async function boot"));
     }
 }
