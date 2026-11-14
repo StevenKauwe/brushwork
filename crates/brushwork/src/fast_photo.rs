@@ -108,6 +108,9 @@ fn new_canvas(canvas: [usize; 2]) -> Painting {
         rec: None,
         planning_clip: None,
         view: 1.0,
+        varnish: crate::VARNISH,
+        weave: crate::WEAVE,
+        lean: None,
         coverage: None,
         origin: [0, 0],
     }
@@ -435,17 +438,18 @@ fn light(p: &Painting) -> Vec<u8> {
             row[x] = acc / 9.0;
         }
     });
-    static WEAVE: [std::sync::OnceLock<Vec<f32>>; 4] = [const { std::sync::OnceLock::new() }; 4];
-    let weave = WEAVE[canvas_slot(p.canvas).expect("validated canvas")].get_or_init(|| {
+    // the weave's threads, a height of 1 (the painting's `weave` scales them)
+    static THREADS: [std::sync::OnceLock<Vec<f32>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    let weave = THREADS[canvas_slot(p.canvas).expect("validated canvas")].get_or_init(|| {
         (0..(wi + 1) * (hi + 1))
             .map(|i| {
                 let (x, y) = (i % (wi + 1), i / (wi + 1));
-                0.02 * ((x as f32 * 1.55).sin() * (y as f32 * 1.55).sin())
+                (x as f32 * 1.55).sin() * (y as f32 * 1.55).sin()
             })
             .collect()
     });
     let hgt = |x: usize, y: usize| -> f32 {
-        let weave = weave[y * (wi + 1) + x];
+        let weave = p.weave * weave[y * (wi + 1) + x];
         let t = soft[y.min(hi - 1) * wi + x.min(wi - 1)];
         t + weave * (1.0 - t).clamp(0.15, 1.0)
     };
@@ -462,7 +466,7 @@ fn light(p: &Painting) -> Vec<u8> {
             // a little richer, as varnished paint is
             let grey = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
             for k in 0..3 {
-                let v = (grey + (c[k] - grey) * 1.2) * shade + spec.max(0.0) * 0.30 * BODY;
+                let v = (grey + (c[k] - grey) * p.varnish) * shade + spec.max(0.0) * 0.30 * BODY;
                 row[x * 3 + k] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }

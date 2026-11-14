@@ -76,7 +76,12 @@ strokes (a painting recorded for the GPU does not keep it). To show a painting a
 changed: `p.layer_rgba_in([x, y], [w, h])` is exactly that rectangle of `layer_rgba()`, for the price of lighting it.
 To paint only the part of a long strip that shows, make a canvas that size `.with_origin([x, y])` (where it sits on the
 strip) and lay the strokes that reach it, moved by `-x, -y`: it lights exactly as the whole strip does there, but for
-its outermost two pixels.
+its outermost two pixels. A canvas from `with_size` keeps only the paint (16 bytes a pixel): the plain picture the
+scene painters work from is made if one of them paints on it.
+
+The light is the painting's own: `p.varnish` (1.2 unless set) is how much richer paint looks lit than its own colour,
+and `p.weave` (0.02) how much the canvas weave shows; `p.varnish = 1.0` lights paint in its own colour, `p.weave = 0.0`
+lights no weave.
 
 ### One sweep along a path
 
