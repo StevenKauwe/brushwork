@@ -3,6 +3,9 @@
 
 use std::f64::consts::PI;
 
+/// Lightweight seeded stroke and stamp plans for caller-owned renderers.
+pub mod marks;
+
 /// The canvas: 1920×1080, origin top-left, y down.
 pub const W: f64 = 1920.0;
 pub const H: f64 = 1080.0;

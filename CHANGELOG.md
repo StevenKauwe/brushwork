@@ -2,6 +2,20 @@
 
 Versions before 0.6.0 are described in their `brushwork 0.X.Y:` commits.
 
+## Unreleased
+
+- `brushwork-kit::marks`: dependency-free, renderer-neutral plans for lightweight bristle strokes, progressive
+  dabs, curved dab/flick stamps and rimmed spatter. Callers provide paths, packed RGB colours and light/dark mixing
+  targets; no product palettes, events, timing, animation physics or renderer dependencies are included.
+- Explicit per-plan seeds use a documented Mulberry32 stream. Monotone `StrokePlan::advance` emits only newly
+  reached segments; drawing in chunks is identical to drawing all at once. Round-capped lines and filled/outlined
+  ellipses are `f64` primitive commands. Static stamps include dimensions that bound every painted primitive.
+- Public arc-length `resample` and lift/flick pressure profiles. Empty and degenerate paths are safe no-ops;
+  duplicate endpoint samples are omitted. Nonfinite/invalid inputs return errors, and work/geometry limits keep
+  browser input bounded. Tiny stamps expand padding rather than clip minimum-width bristles or rims.
+- **No oil pixel changes:** this is an opt-in planner, separate from the existing CPU/GPU engines. The existing
+  example frame's PNG hashes identically before and after; no engine, shader or painter formulas changed.
+
 ## Known, for 0.7
 
 Kept for a breaking release, or until something needs them:

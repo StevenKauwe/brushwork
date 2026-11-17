@@ -21,7 +21,7 @@ and any corner the hand paused on stay where they were.
 |---|---|
 | [`brushwork`](crates/brushwork) | the engine: strokes, the frame painter (`run`, `run_clip`, `paint_frame`), photo painting (`run_photo`), and the optional GPU backend |
 | [`brushwork-paint`](crates/brushwork-paint) | the shape recorder a film's shots draw with (`Rec`: paint, ink lines, glows, camera), `Film`/`Shot`, look presets, transitions |
-| [`brushwork-kit`](crates/brushwork-kit) | the brush kit: time, easing, motion, geometry, colour, and the spectral pigment mixer |
+| [`brushwork-kit`](crates/brushwork-kit) | the brush kit: lightweight seeded stroke/stamp plans, time, easing, motion, geometry, colour, and the spectral pigment mixer |
 | [`tools/flickscan`](tools/flickscan) | finds flickering strokes in a rendered frame sequence |
 | [`brushwork-web`](crates/brushwork-web) | the canvas page (wasm-bindgen + web-sys); `tools/build-web.sh` builds it into `dist/` |
 | [`tools/webcheck`](tools/webcheck) | opens the page in WebKit or Chromium through WebDriver and checks it paints, says which backend painted, and (`--compare`) that the browser's GPU agrees with its CPU |
@@ -52,6 +52,49 @@ film.
 A film's `main` usually hands its command line to `brushwork::run` (one frame: `oil <t> <out.png>`) and
 `brushwork::run_clip` (a stretch: `oilclip <t0> <t1> <dir>`). `brushwork::run_photo_with` paints a photograph.
 `Painting`, `paint_body` and the p5.brush-style `brush_fill` / `brush_wash` / `brush_stroke` lay strokes directly.
+
+### Lightweight strokes and cached stamps
+
+For a Canvas2D overlay or another lightweight renderer, `brushwork_kit::marks` plans paint without running the oil
+engine. It has no dependencies. Each stroke has an explicit seed, a thinner body under wandering lighter/darker
+bristles, a pressure profile, and a dry tail. Dabs, hair-to-drop flicks and rimmed spatter can be planned once and
+rasterized into reusable stamps. The caller supplies every colour, including the light/dark mixing targets:
+
+```rust
+use brushwork_kit::marks::{Ink, Primitive, Stamp, StampKind, StrokeOptions, StrokePlan};
+
+let ink = Ink { color: 0x3486ab, light: 0xffffff, dark: 0x101010 }; // caller's palette, packed 0xRRGGBB
+let mut stroke = StrokePlan::new(&[[8.0, 12.0], [90.0, 36.0]], 18.0, ink, 42, StrokeOptions::default())?;
+let first_half: Vec<Primitive> = stroke.advance(0.5)?;
+let remainder = stroke.advance(1.0)?; // render only these new commands; do not repaint the first half
+assert!(stroke.advance(1.0)?.is_empty());
+
+let stamp = Stamp::new(StampKind::Flick, 20.0, ink, 73)?;
+// Rasterize stamp.primitives once into a transparent stamp.width × stamp.height surface, then cache it.
+// StrokePlan::dab(center, size, ink, seed) provides a short dab with the same progressive drawing API.
+```
+
+Commands are `Primitive::Line`, `FillEllipse` and `StrokeEllipse`, with `f64` coordinates, widths, radii, rotation
+in radians and opacity, and packed RGB colours. Draw in order using source-over alpha, **round line caps**, and
+centered ellipse outlines. The width/height and coordinates of a stamp are logical units; the renderer owns pixel
+density, transforms, caching and antialiasing. All geometric paint bounds, including caps and outlines, lie inside
+the stamp rectangle. Tiny stamps gain padding if their minimum bristle/rim widths would otherwise be clipped.
+
+`advance` accepts finite progress, clamps it to `0..=1`, and returns only newly reached complete segments. Repeated
+or backward progress is an allocation-free no-op. Any sequence ending at `1` concatenates to exactly the same
+commands as drawing all at once; an invalid progress value leaves the cursor unchanged. Supply eased progress if
+wanted. Paths, event triggers, duration, page composition and particle physics stay in the application.
+
+`resample(points, step)` is also public: it preserves both endpoints, carries arc length through corners and does
+not duplicate an already sampled endpoint. Empty or wholly coincident paths draw nothing. `PressureProfile::Lift`
+and `Flick` expose their width through `.at(progress)`. Default stroke settings are body opacity `0.9`, lift
+pressure, dry cutoff `0.9` and sampling step `3`; a cutoff greater than `1` keeps the body to the end.
+
+Invalid/nonfinite inputs return `MarkError`. Work is bounded: at most 16,384 input or resampled points, 262,144
+potential stroke commands, absolute input coordinates up to 1e9, brush width up to 4096, and stamp size up to 1024.
+These limits are public constants. A plan uses only its seed, never ambient randomness, canvas size or frame order.
+The documented Mulberry32 stream folds the two halves of a `u64` seed with XOR; use distinct folded seeds for
+distinct streams. Geometry uses ordinary `f64` trigonometry, so different targets may differ by a few ulps.
 
 ### A canvas of any size, and the paint as a layer
 
